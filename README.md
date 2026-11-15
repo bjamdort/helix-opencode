@@ -47,6 +47,22 @@ Note: Only certain languages have indentation definitions at the moment. Check
 
 [Installation documentation](https://docs.helix-editor.com/install.html).
 
+To build and install this checkout for your user, run:
+
+```sh
+./scripts/install-local.sh
+```
+
+The script builds a locked release binary, including tree-sitter grammars, and
+installs `hx` and `helix` in `~/.local/bin`. Keep that directory ahead of
+`/usr/bin` in your `PATH`. The installed binary uses this checkout's `runtime`
+directory, so keep the checkout in place. Existing Helix configuration is left
+unchanged. Run the script again after updating the source.
+
+On Arch Linux, after installing this build, remove the distribution package with
+`sudo pacman -R helix`. If your shell still remembers the old executable, open a
+new terminal or clear its command cache (`hash -r` in Bash, `rehash` in Zsh).
+
 [![Packaging status](https://repology.org/badge/vertical-allrepos/helix-editor.svg?exclude_unsupported=1)](https://repology.org/project/helix-editor/versions)
 
 # Contributing
