@@ -4118,10 +4118,10 @@ fn execute_command_line(
     cx: &mut compositor::Context,
     input: &str,
     event: PromptEvent,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<compositor::Callback>> {
     let (command, rest, _) = command_line::split(input);
     if command.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
 
     // If command is numeric, interpret as line number and go there.
@@ -4133,7 +4133,7 @@ fn execute_command_line(
     match typed::TYPABLE_COMMAND_MAP.get(command) {
         Some(cmd) => execute_command(cx, cmd, rest, event),
         None if event == PromptEvent::Validate => Err(anyhow!("no such command: '{command}'")),
-        None => Ok(()),
+        None => Ok(None),
     }
 }
 
@@ -4142,7 +4142,17 @@ pub(super) fn execute_command(
     cmd: &TypableCommand,
     args: &str,
     event: PromptEvent,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<compositor::Callback>> {
+    if cx.editor.focused_pane.is_some()
+        && !matches!(cmd.name, "quit" | "quit!")
+        && !super::pane::typed_is_workspace(cmd.name)
+    {
+        return if event == PromptEvent::Validate {
+            Err(anyhow!(super::pane::requires_document(cmd.name)))
+        } else {
+            Ok(None)
+        };
+    }
     let args = if event == PromptEvent::Validate {
         Args::parse(args, cmd.signature, true, |token| {
             expansion::expand(cx.editor, token).map_err(|err| err.into())
@@ -4153,7 +4163,18 @@ pub(super) fn execute_command(
             .expect("arg parsing cannot fail when validation is turned off")
     };
 
-    (cmd.fun)(cx, args, event).map_err(|err| anyhow!("'{}': {err}", cmd.name))
+    if let Some(target) = cx
+        .editor
+        .focused_pane
+        .filter(|_| matches!(cmd.name, "quit" | "quit!"))
+    {
+        if event == PromptEvent::Validate {
+            return Ok(Some(super::pane::close_callback(target)));
+        }
+        return Ok(None);
+    }
+    (cmd.fun)(cx, args, event).map_err(|err| anyhow!("'{}': {err}", cmd.name))?;
+    Ok(None)
 }
 
 #[allow(clippy::unnecessary_unwrap)]
@@ -4167,7 +4188,16 @@ pub(super) fn command_mode(cx: &mut Context) {
                 cx.editor.set_error(err.to_string());
             }
         },
-    );
+    )
+    .with_validate_callback(|cx, input| {
+        match execute_command_line(cx, input, PromptEvent::Validate) {
+            Ok(callback) => callback,
+            Err(error) => {
+                cx.editor.set_error(error.to_string());
+                None
+            }
+        }
+    });
     prompt.doc_fn = Box::new(command_line_doc);
 
     // Calculate initial completion

@@ -26,6 +26,7 @@ type PromptCharHandler = Box<dyn Fn(&mut Prompt, char, &Context)>;
 pub type Completion = (RangeFrom<usize>, Span<'static>);
 type CompletionFn = Box<dyn FnMut(&Editor, &str) -> Vec<Completion>>;
 type CallbackFn = Box<dyn FnMut(&mut Context, &str, PromptEvent)>;
+type ValidateCallbackFn = Box<dyn FnMut(&mut Context, &str) -> Option<crate::compositor::Callback>>;
 pub type DocFn = Box<dyn Fn(&str) -> Option<Cow<str>>>;
 
 pub struct Prompt {
@@ -44,6 +45,7 @@ pub struct Prompt {
     history_pos: Option<usize>,
     completion_fn: CompletionFn,
     callback_fn: CallbackFn,
+    validate_callback: Option<ValidateCallbackFn>,
     pub doc_fn: DocFn,
     next_char_handler: Option<PromptCharHandler>,
     language: Option<(&'static str, Arc<ArcSwap<syntax::Loader>>)>,
@@ -100,6 +102,7 @@ impl Prompt {
             history_pos: None,
             completion_fn: Box::new(completion_fn),
             callback_fn: Box::new(callback_fn),
+            validate_callback: None,
             doc_fn: Box::new(|_| None),
             next_char_handler: None,
             language: None,
@@ -114,6 +117,15 @@ impl Prompt {
 
     pub fn with_line(mut self, line: String, editor: &Editor) -> Self {
         self.set_line(line, editor);
+        self
+    }
+
+    /// Return a compositor action to run after the prompt has closed.
+    pub fn with_validate_callback(
+        mut self,
+        callback: impl FnMut(&mut Context, &str) -> Option<crate::compositor::Callback> + 'static,
+    ) -> Self {
+        self.validate_callback = Some(Box::new(callback));
         self
     }
 
@@ -703,6 +715,15 @@ impl Component for Prompt {
                         &self.line
                     };
 
+                    if let Some(validate) = &mut self.validate_callback {
+                        let after = validate(cx, input);
+                        return EventResult::Consumed(Some(Box::new(move |compositor, cx| {
+                            compositor.pop();
+                            if let Some(after) = after {
+                                after(compositor, cx);
+                            }
+                        })));
+                    }
                     (self.callback_fn)(cx, input, PromptEvent::Validate);
 
                     return close_fn;

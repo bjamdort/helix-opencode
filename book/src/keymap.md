@@ -333,7 +333,21 @@ directory. Opening a file keeps the sidebar visible and returns focus to the edi
 
 Use `Ctrl-w h` from the leftmost editor split to focus the sidebar. Use `Ctrl-w l`,
 `Tab`, or `Esc` in the sidebar to return to the editor. `Space w h` and `Space w l`
-also switch focus.
+also switch focus. Window rotation (`Ctrl-w w`) includes the sidebar and editor
+splits.
+
+The explorer uses Helix's normal-mode keymap, with a small pane-specific layer for
+activation, refresh, and closing. Normal-mode remappings for shared commands and
+navigation apply here too, including counts such as `3j`. Prefix menus, the
+command palette (`Space ?`), and the command prompt (`:`) remain available.
+
+From the explorer, `:qa` quits Helix (with the usual unsaved-buffer checks), while
+`:q` and `Ctrl-w q` close only the explorer. Global commands such as `:theme`,
+`:config-reload`, and `:workspace-trust` work without leaving it. Cancelling a
+prompt returns to the explorer. Document-only commands, such as inserting text,
+deleting selections, and `:sort`, report that they require a document pane rather
+than acting on the buffer behind the explorer. Opening a file focuses the target
+document pane.
 
 | Key              | Description                                  |
 | ----             | -----------                                  |
@@ -342,7 +356,7 @@ also switch focus.
 | `h`, `Left`      | Collapse directory or select parent          |
 | `l`, `Right`     | Expand directory                             |
 | `Enter`          | Open file or toggle directory                |
-| `g`, `Home`      | Select first entry                           |
+| `gg`, `Home`     | Select first entry                           |
 | `G`, `End`       | Select last entry                            |
 | `r`              | Refresh tree                                 |
 | `q`, `Space E`   | Close sidebar                                |

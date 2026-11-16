@@ -305,9 +305,25 @@ impl Keymaps {
     /// key cancels pending keystrokes. If there are no pending keystrokes but a
     /// sticky node is in use, it will be cleared.
     pub fn get(&mut self, mode: Mode, key: KeyEvent) -> KeymapResult {
+        self.get_with_overlay(mode, key, None)
+    }
+
+    /// Use the normal Helix keymap engine with pane-specific bindings layered on top.
+    pub fn get_with_overlay(
+        &mut self,
+        mode: Mode,
+        key: KeyEvent,
+        overlay: Option<&KeyTrie>,
+    ) -> KeymapResult {
         // TODO: remove the sticky part and look up manually
         let keymaps = &*self.map();
         let keymap = &keymaps[&mode];
+        let merged = overlay.map(|overlay| {
+            let mut keymap = keymap.clone();
+            keymap.merge_nodes(overlay.clone());
+            keymap
+        });
+        let keymap = merged.as_ref().unwrap_or(keymap);
 
         if key!(Esc) == key {
             if !self.state.is_empty() {
@@ -354,6 +370,11 @@ impl Keymaps {
             None => KeymapResult::Cancelled(self.state.drain(..).collect()),
         }
     }
+
+    pub fn reset(&mut self) {
+        self.state.clear();
+        self.sticky = None;
+    }
 }
 
 impl Default for Keymaps {
@@ -382,6 +403,52 @@ mod tests {
     use helix_core::hashmap;
     use helix_view::input::{KeyCode, KeyEvent, KeyModifiers};
     use indexmap::indexmap;
+
+    #[test]
+    fn pane_overlay_keeps_global_prefixes_and_can_cancel_pending_keys() {
+        let overlay = keymap!({ "Pane"
+            "r" => pane_refresh,
+            "esc" => focus_document_pane,
+        });
+        let mut keys = Keymaps::default();
+        assert_eq!(
+            keys.get_with_overlay(Mode::Normal, key!(':'), Some(&overlay)),
+            KeymapResult::Matched(MappableCommand::command_mode)
+        );
+        assert_eq!(
+            keys.get_with_overlay(Mode::Normal, key!('r'), Some(&overlay)),
+            KeymapResult::Matched(MappableCommand::pane_refresh)
+        );
+        assert!(matches!(
+            keys.get_with_overlay(Mode::Normal, key!(' '), Some(&overlay)),
+            KeymapResult::Pending(_)
+        ));
+        assert_eq!(
+            keys.get_with_overlay(Mode::Normal, key!('E'), Some(&overlay)),
+            KeymapResult::Matched(MappableCommand::toggle_file_explorer)
+        );
+        assert!(matches!(
+            keys.get_with_overlay(Mode::Normal, key!('g'), Some(&overlay)),
+            KeymapResult::Pending(_)
+        ));
+        assert!(matches!(
+            keys.get_with_overlay(Mode::Normal, key!(Esc), Some(&overlay)),
+            KeymapResult::Cancelled(_)
+        ));
+        assert_eq!(
+            keys.get_with_overlay(Mode::Normal, key!(Esc), Some(&overlay)),
+            KeymapResult::Matched(MappableCommand::focus_document_pane)
+        );
+        assert!(matches!(
+            keys.get_with_overlay(Mode::Normal, key!('g'), Some(&overlay)),
+            KeymapResult::Pending(_)
+        ));
+        keys.reset();
+        assert_eq!(
+            keys.get(Mode::Normal, key!('i')),
+            KeymapResult::Matched(MappableCommand::insert_mode)
+        );
+    }
 
     #[test]
     #[should_panic]

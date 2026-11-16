@@ -48,6 +48,8 @@ impl std::fmt::Display for DocumentId {
 
 slotmap::new_key_type! {
     pub struct ViewId;
+    /// A non-document pane owned by the frontend.
+    pub struct PaneId;
 }
 
 pub enum Align {

@@ -1,5 +1,6 @@
 pub(crate) mod dap;
 pub(crate) mod lsp;
+pub(crate) mod pane;
 pub(crate) mod syntax;
 pub(crate) mod typed;
 
@@ -247,18 +248,32 @@ macro_rules! static_commands {
 
 impl MappableCommand {
     pub fn execute(&self, cx: &mut Context) {
+        if cx.editor.focused_pane.is_some() {
+            match pane::scope(self) {
+                pane::CommandScope::Document => {
+                    cx.editor.set_error(pane::requires_document(self.name()));
+                    return;
+                }
+                pane::CommandScope::Pane(command) => {
+                    pane::dispatch(cx, command);
+                    return;
+                }
+                pane::CommandScope::Workspace => (),
+            }
+        }
         match &self {
             Self::Typable { name, args, doc: _ } => {
                 if let Some(command) = typed::TYPABLE_COMMAND_MAP.get(name.as_str()) {
-                    let mut cx = compositor::Context {
+                    let mut context = compositor::Context {
                         editor: cx.editor,
                         jobs: cx.jobs,
                         scroll: None,
                     };
-                    if let Err(e) =
-                        typed::execute_command(&mut cx, command, args, PromptEvent::Validate)
+                    match typed::execute_command(&mut context, command, args, PromptEvent::Validate)
                     {
-                        cx.editor.set_error(format!("{}", e));
+                        Ok(Some(callback)) => cx.callback.push(callback),
+                        Ok(None) => (),
+                        Err(error) => cx.editor.set_error(error.to_string()),
                     }
                 } else {
                     cx.editor.set_error(format!("no such command: '{name}'"));
@@ -405,6 +420,10 @@ impl MappableCommand {
         file_picker_in_current_directory, "Open file picker at current working directory",
         file_explorer, "Open file explorer in workspace root",
         toggle_file_explorer, "Toggle the file explorer sidebar",
+        pane_activate, "Activate the selected pane item",
+        pane_refresh, "Refresh the focused pane",
+        pane_close, "Close the focused pane",
+        focus_document_pane, "Focus the last document pane",
         file_explorer_in_current_buffer_directory, "Open file explorer at current buffer's directory",
         file_explorer_in_current_directory, "Open file explorer at current working directory",
         code_action, "Perform code action",
@@ -722,6 +741,20 @@ impl PartialEq for MappableCommand {
 }
 
 fn no_op(_cx: &mut Context) {}
+
+fn pane_activate(cx: &mut Context) {
+    cx.editor.set_error("No auxiliary pane is focused");
+}
+
+fn pane_refresh(cx: &mut Context) {
+    cx.editor.set_error("No auxiliary pane is focused");
+}
+
+fn pane_close(cx: &mut Context) {
+    wclose(cx);
+}
+
+fn focus_document_pane(_cx: &mut Context) {}
 
 type MoveFn =
     fn(RopeSlice, Range, Direction, usize, Movement, &TextFormat, &mut TextAnnotations) -> Range;
@@ -3229,7 +3262,7 @@ fn open_file_tree(cx: &mut Context, root: PathBuf) {
     cx.editor.enter_normal_mode();
     cx.callback.push(Box::new(move |compositor, cx| {
         if let Some(editor) = compositor.find::<ui::EditorView>() {
-            if let Err(error) = editor.open_file_tree(root) {
+            if let Err(error) = editor.open_file_tree(root, cx.editor) {
                 cx.editor.set_error(format!("File explorer: {error}"));
             }
         }
@@ -3241,7 +3274,7 @@ fn toggle_file_explorer(cx: &mut Context) {
     cx.editor.enter_normal_mode();
     cx.callback.push(Box::new(move |compositor, cx| {
         if let Some(editor) = compositor.find::<ui::EditorView>() {
-            if let Err(error) = editor.toggle_file_tree(root) {
+            if let Err(error) = editor.toggle_file_tree(root, cx.editor) {
                 cx.editor.set_error(format!("File explorer: {error}"));
             }
         }
@@ -3598,19 +3631,36 @@ pub fn command_palette(cx: &mut Context) {
 
     cx.callback.push(Box::new(
         move |compositor: &mut Compositor, cx: &mut compositor::Context| {
-            let keymap = compositor.find::<ui::EditorView>().unwrap().keymaps.map()
-                [&cx.editor.mode]
-                .reverse_map();
+            let view = compositor.find::<ui::EditorView>().unwrap();
+            let mut active_keymap = view.keymaps.map()[&cx.editor.mode].clone();
+            if let Some(overlay) = view.panes.keymap(cx.editor) {
+                active_keymap.merge_nodes(overlay.clone());
+            }
+            let keymap = active_keymap.reverse_map();
+            let pane_focused = cx.editor.focused_pane.is_some();
 
-            let commands = MappableCommand::STATIC_COMMAND_LIST.iter().cloned().chain(
-                typed::TYPABLE_COMMAND_LIST
-                    .iter()
-                    .map(|cmd| MappableCommand::Typable {
-                        name: cmd.name.to_owned(),
-                        args: String::new(),
-                        doc: cmd.doc.to_owned(),
-                    }),
-            );
+            let commands = MappableCommand::STATIC_COMMAND_LIST
+                .iter()
+                .cloned()
+                .chain(
+                    typed::TYPABLE_COMMAND_LIST
+                        .iter()
+                        .map(|cmd| MappableCommand::Typable {
+                            name: cmd.name.to_owned(),
+                            args: String::new(),
+                            doc: cmd.doc.to_owned(),
+                        }),
+                )
+                .filter(move |command| {
+                    !pane_focused
+                        || match command {
+                            MappableCommand::Typable { name, .. } => {
+                                pane::typed_is_workspace(name)
+                                    || matches!(name.as_str(), "quit" | "quit!")
+                            }
+                            _ => pane::scope(command) != pane::CommandScope::Document,
+                        }
+                });
 
             let columns = [
                 ui::PickerColumn::new("name", |item, _| match item {
@@ -3643,32 +3693,40 @@ pub fn command_palette(cx: &mut Context) {
                 ui::PickerColumn::new("doc", |item: &MappableCommand, _| item.doc().into()),
             ];
 
-            let picker = Picker::new(columns, 0, commands, keymap, move |cx, command, _action| {
-                let mut ctx = Context {
-                    register,
-                    count,
-                    editor: cx.editor,
-                    callback: Vec::new(),
-                    on_next_key_callback: None,
-                    jobs: cx.jobs,
-                };
-                let focus = view!(ctx.editor).id;
-
-                command.execute(&mut ctx);
-
-                if ctx.editor.tree.contains(focus) {
-                    let config = ctx.editor.config();
-                    let mode = ctx.editor.mode();
-                    let view = view_mut!(ctx.editor, focus);
-                    let doc = doc_mut!(ctx.editor, &view.doc);
-
-                    view.ensure_cursor_in_view(doc, config.scrolloff);
-
-                    if mode != Mode::Insert {
-                        doc.append_changes_to_history(view);
-                    }
-                }
-            });
+            let picker = Picker::new(columns, 0, commands, keymap, |_, _, _| {})
+                .with_compositor_callback(move |_cx, command, _action| {
+                    // Execute after the picker has been removed, including compositor
+                    // callbacks (pane commands and prompts cannot be run without them).
+                    let command = command.clone();
+                    Some(Box::new(move |compositor, context| {
+                        let mut ctx = Context {
+                            register,
+                            count,
+                            editor: context.editor,
+                            callback: Vec::new(),
+                            on_next_key_callback: None,
+                            jobs: context.jobs,
+                        };
+                        command.execute(&mut ctx);
+                        let callbacks = std::mem::take(&mut ctx.callback);
+                        let next_key = ctx.on_next_key_callback.take();
+                        if let Some(view) = compositor.find::<ui::EditorView>() {
+                            view.set_next_key_callback(next_key);
+                        }
+                        for callback in callbacks {
+                            callback(compositor, context);
+                        }
+                        if !context.editor.should_close() {
+                            let config = context.editor.config();
+                            let mode = context.editor.mode();
+                            let (view, doc) = current!(context.editor);
+                            view.ensure_cursor_in_view(doc, config.scrolloff);
+                            if mode != Mode::Insert {
+                                doc.append_changes_to_history(view);
+                            }
+                        }
+                    }))
+                });
             compositor.push(Box::new(overlaid(picker)));
         },
     ));
@@ -5939,36 +5997,43 @@ fn save_selection(cx: &mut Context) {
 }
 
 fn rotate_view(cx: &mut Context) {
-    cx.editor.focus_next()
+    cx.callback.push(Box::new(|compositor, cx| {
+        if let Some(view) = compositor.find::<ui::EditorView>() {
+            view.panes.rotate(false, cx.editor);
+        }
+    }));
 }
 
 fn rotate_view_reverse(cx: &mut Context) {
-    cx.editor.focus_prev()
+    cx.callback.push(Box::new(|compositor, cx| {
+        if let Some(view) = compositor.find::<ui::EditorView>() {
+            view.panes.rotate(true, cx.editor);
+        }
+    }));
 }
 
 fn jump_view_right(cx: &mut Context) {
-    cx.editor.focus_direction(tree::Direction::Right)
+    focus_pane_direction(cx, tree::Direction::Right);
 }
 
 fn jump_view_left(cx: &mut Context) {
-    let previous = cx.editor.tree.focus;
-    cx.editor.focus_direction(tree::Direction::Left);
-    if cx.editor.tree.focus == previous {
-        cx.editor.enter_normal_mode();
-        cx.callback.push(Box::new(|compositor, _cx| {
-            if let Some(editor) = compositor.find::<ui::EditorView>() {
-                editor.focus_file_tree();
-            }
-        }));
-    }
+    focus_pane_direction(cx, tree::Direction::Left);
 }
 
 fn jump_view_up(cx: &mut Context) {
-    cx.editor.focus_direction(tree::Direction::Up)
+    focus_pane_direction(cx, tree::Direction::Up);
 }
 
 fn jump_view_down(cx: &mut Context) {
-    cx.editor.focus_direction(tree::Direction::Down)
+    focus_pane_direction(cx, tree::Direction::Down);
+}
+
+fn focus_pane_direction(cx: &mut Context, direction: tree::Direction) {
+    cx.callback.push(Box::new(move |compositor, cx| {
+        if let Some(view) = compositor.find::<ui::EditorView>() {
+            view.panes.focus_direction(direction, cx.editor);
+        }
+    }));
 }
 
 fn swap_view_right(cx: &mut Context) {
@@ -6027,6 +6092,10 @@ fn vsplit_new(cx: &mut Context) {
 }
 
 fn wclose(cx: &mut Context) {
+    if cx.editor.focused_pane.is_some() {
+        pane::dispatch(cx, pane::PaneCommand::Close);
+        return;
+    }
     if cx.editor.tree.views().count() == 1 {
         if let Err(err) = typed::buffers_remaining_impl(cx.editor) {
             cx.editor.set_error(err.to_string());

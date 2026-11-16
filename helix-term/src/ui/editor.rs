@@ -36,7 +36,8 @@ use std::{mem::take, num::NonZeroUsize, ops, path::PathBuf, rc::Rc};
 use tui::{buffer::Buffer as Surface, text::Span};
 
 pub struct EditorView {
-    file_tree: Option<super::file_tree::FileTree>,
+    pub(crate) panes: super::pane::PaneManager,
+    keymap_pane: Option<helix_view::PaneId>,
     pub keymaps: Keymaps,
     on_next_key: Option<(OnKeyCallback, OnKeyCallbackKind)>,
     pseudo_pending: Vec<KeyEvent>,
@@ -61,7 +62,8 @@ pub enum InsertEvent {
 impl EditorView {
     pub fn new(keymaps: Keymaps) -> Self {
         Self {
-            file_tree: None,
+            panes: super::pane::PaneManager::default(),
+            keymap_pane: None,
             keymaps,
             on_next_key: None,
             pseudo_pending: Vec::new(),
@@ -76,34 +78,54 @@ impl EditorView {
         &mut self.spinners
     }
 
-    pub fn open_file_tree(&mut self, root: PathBuf) -> std::io::Result<()> {
-        if let Some(tree) = self.file_tree.as_mut().filter(|tree| tree.root == root) {
-            tree.focused = true;
-            tree.request_git_refresh();
+    pub(crate) fn set_next_key_callback(
+        &mut self,
+        callback: Option<(OnKeyCallback, OnKeyCallbackKind)>,
+    ) {
+        self.on_next_key = callback;
+    }
+
+    pub fn open_file_tree(&mut self, root: PathBuf, editor: &mut Editor) -> std::io::Result<()> {
+        if let Some(id) = self.panes.find(super::file_tree::ID) {
+            let tree = self
+                .panes
+                .get_mut::<super::file_tree::FileTree>(id)
+                .unwrap();
+            if tree.root != root {
+                *tree = super::file_tree::FileTree::new(root)?;
+            }
+            self.panes.focus_pane(id, editor);
         } else {
-            self.file_tree = Some(super::file_tree::FileTree::new(root)?);
+            self.panes.insert(
+                super::file_tree::FileTree::new(root)?,
+                super::pane::Dock::Left,
+                32,
+                editor,
+            );
         }
         Ok(())
     }
 
-    pub fn toggle_file_tree(&mut self, root: PathBuf) -> std::io::Result<()> {
-        if self.file_tree.is_some() {
-            self.file_tree = None;
+    pub fn toggle_file_tree(&mut self, root: PathBuf, editor: &mut Editor) -> std::io::Result<()> {
+        if let Some(id) = self.panes.find(super::file_tree::ID) {
+            self.panes.remove(id, editor);
             Ok(())
         } else {
-            self.open_file_tree(root)
+            self.open_file_tree(root, editor)
         }
     }
 
-    pub fn focus_file_tree(&mut self) {
-        if let Some(tree) = &mut self.file_tree {
-            tree.focused = true;
-            tree.request_git_refresh();
+    fn sync_pane_focus(&mut self, editor: &mut Editor) {
+        if self.keymap_pane != editor.focused_pane {
+            self.keymap_pane = editor.focused_pane;
+            self.keymaps.reset();
+            self.on_next_key = None;
+            self.pseudo_pending.clear();
+            editor.count = None;
+            editor.selected_register = None;
+            editor.autoinfo = None;
+            self.clear_completion(editor);
         }
-    }
-
-    pub(super) fn file_tree_mut(&mut self) -> Option<&mut super::file_tree::FileTree> {
-        self.file_tree.as_mut()
     }
 
     pub fn render_view(
@@ -970,7 +992,9 @@ impl EditorView {
     ) -> Option<KeymapResult> {
         let mut last_mode = mode;
         self.pseudo_pending.extend(self.keymaps.pending());
-        let key_result = self.keymaps.get(mode, event);
+        let key_result = self
+            .keymaps
+            .get_with_overlay(mode, event, self.panes.keymap(cxt.editor));
         cxt.editor.autoinfo = self.keymaps.sticky().map(|node| node.infobox());
 
         let mut execute_command = |command: &commands::MappableCommand| {
@@ -1059,7 +1083,9 @@ impl EditorView {
                 cxt.editor.count = NonZeroUsize::new(i);
             }
             // special handling for repeat operator
-            (key!('.'), _) if self.keymaps.pending().is_empty() => {
+            (key!('.'), _)
+                if self.keymaps.pending().is_empty() && cxt.editor.focused_pane.is_none() =>
+            {
                 for _ in 0..cxt.editor.count.map_or(1, NonZeroUsize::into) {
                     // first execute whatever put us into insert mode
                     self.last_insert.0.execute(cxt);
@@ -1479,13 +1505,13 @@ impl Component for EditorView {
         event: &Event,
         context: &mut crate::compositor::Context,
     ) -> EventResult {
-        if let Some(tree) = &mut self.file_tree {
-            if tree.handle_event(event, context.editor) {
-                if tree.close_requested {
-                    self.file_tree = None;
-                }
+        self.sync_pane_focus(context.editor);
+        if let Event::Mouse(mouse) = event {
+            if self.panes.mouse(mouse, context.editor) {
+                self.sync_pane_focus(context.editor);
                 return EventResult::Consumed(None);
             }
+            self.sync_pane_focus(context.editor);
         }
         let mut cx = commands::Context {
             editor: context.editor,
@@ -1498,6 +1524,9 @@ impl Component for EditorView {
 
         match event {
             Event::Paste(contents) => {
+                if cx.editor.focused_pane.is_some() {
+                    return EventResult::Consumed(None);
+                }
                 self.handle_non_key_input(&mut cx);
                 cx.count = cx.editor.count;
                 commands::paste_bracketed_value(&mut cx, contents.clone());
@@ -1627,8 +1656,10 @@ impl Component for EditorView {
             }
 
             Event::Mouse(event) => self.handle_mouse_event(event, &mut cx),
+            Event::IdleTimeout if cx.editor.focused_pane.is_some() => EventResult::Consumed(None),
             Event::IdleTimeout => self.handle_idle_timeout(&mut cx),
             Event::FocusGained => {
+                self.panes.refresh();
                 self.terminal_focused = true;
                 EventResult::Consumed(None)
             }
@@ -1669,20 +1700,9 @@ impl Component for EditorView {
             editor_area = editor_area.clip_top(1);
         }
 
-        let sidebar_width = if self.file_tree.is_some() && editor_area.width >= 20 {
-            (editor_area.width / 3).min(32)
-        } else {
-            0
-        };
-        if let Some(tree) = &mut self.file_tree {
-            tree.update_git_status(cx.editor, cx.jobs);
-            tree.render(
-                editor_area.with_width(sidebar_width),
-                surface,
-                &cx.editor.theme,
-            );
-        }
-        editor_area = editor_area.clip_left(sidebar_width);
+        editor_area = self.panes.layout(editor_area, &mut cx.editor.focused_pane);
+        self.sync_pane_focus(cx.editor);
+        self.panes.render(surface, cx.editor, cx.jobs);
 
         // if the terminal size suddenly changed, we need to trigger a resize
         cx.editor.resize(editor_area);
@@ -1693,14 +1713,14 @@ impl Component for EditorView {
 
         for (view, is_focused) in cx.editor.tree.views() {
             let doc = cx.editor.document(view.doc).unwrap();
-            let tree_focused = self.file_tree.as_ref().is_some_and(|tree| tree.focused);
+            let document_focused = cx.editor.focused_pane.is_none();
             self.render_view(
                 cx.editor,
                 doc,
                 view,
                 area,
                 surface,
-                is_focused && !tree_focused,
+                is_focused && document_focused,
             );
         }
 
@@ -1793,8 +1813,8 @@ impl Component for EditorView {
     }
 
     fn cursor(&self, _area: Rect, editor: &Editor) -> (Option<Position>, CursorKind) {
-        if let Some(tree) = self.file_tree.as_ref().filter(|tree| tree.focused) {
-            return tree.cursor();
+        if let Some(cursor) = self.panes.cursor(editor) {
+            return cursor;
         }
         match editor.cursor() {
             // all block cursors are drawn manually

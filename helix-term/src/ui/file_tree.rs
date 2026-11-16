@@ -8,21 +8,23 @@ use std::{
     time::{Duration, Instant},
 };
 
-use helix_core::Position;
+use helix_core::{hashmap, Position};
 use helix_view::{
     editor::Action,
     graphics::{CursorKind, Rect},
     input::{MouseButton, MouseEventKind},
-    Editor, Theme,
+    Editor, PaneId, Theme,
 };
 use tui::buffer::Buffer as Surface;
 
+use super::pane::{Pane, PaneOutcome};
 use crate::{
-    compositor::Event,
-    ctrl,
+    commands::pane::PaneCommand,
     job::{Callback, Jobs},
-    key,
+    keymap::{macros::keymap, KeyTrie},
 };
+
+pub(super) const ID: &str = "file-tree";
 
 struct Entry {
     path: PathBuf,
@@ -103,14 +105,14 @@ mod tests {
         let area = Rect::new(0, 0, 20, 4);
         let theme = &helix_view::theme::DEFAULT_THEME;
         let mut surface = Surface::empty(area);
-        tree.render(area, &mut surface, theme);
+        tree.render(area, &mut surface, theme, true);
         assert_eq!(
             surface.get(0, 1).unwrap().symbol.as_str(),
             tree.entries[0].icon(false)
         );
         tree.expand()?;
         let mut surface = Surface::empty(area);
-        tree.render(area, &mut surface, theme);
+        tree.render(area, &mut surface, theme, true);
         assert_eq!(
             surface.get(0, 1).unwrap().symbol.as_str(),
             tree.entries[0].icon(true)
@@ -135,7 +137,7 @@ mod tests {
         let theme = &helix_view::theme::DEFAULT_THEME;
         let area = Rect::new(0, 0, 20, 5);
         let mut surface = Surface::empty(area);
-        tree.render(area, &mut surface, theme);
+        tree.render(area, &mut surface, theme, true);
         assert_eq!(surface.get(18, 0).unwrap().symbol.as_str(), "M");
         assert_eq!(surface.get(18, 1).unwrap().symbol.as_str(), "M");
         assert_eq!(surface.get(18, 2).unwrap().symbol.as_str(), " ");
@@ -156,7 +158,7 @@ mod tests {
         // Tiny terminals must never place a status marker outside the sidebar.
         for width in 0..5 {
             let area = Rect::new(0, 0, width, 3);
-            tree.render(area, &mut Surface::empty(area), theme);
+            tree.render(area, &mut Surface::empty(area), theme, true);
         }
         Ok(())
     }
@@ -252,15 +254,12 @@ mod tests {
 /// A persistent sidebar, independent of the document split tree.
 pub(super) struct FileTree {
     pub root: PathBuf,
-    pub focused: bool,
-    pub close_requested: bool,
+    keymap: KeyTrie,
     entries: Vec<Entry>,
     expanded: HashSet<PathBuf>,
     selected: usize,
     offset: usize,
     area: Rect,
-    window_prefix: bool,
-    space_prefix: bool,
     git_status: git::Snapshot,
     git_pending: Option<Arc<()>>,
     git_last_refresh: Option<Instant>,
@@ -271,15 +270,19 @@ impl FileTree {
     pub fn new(root: PathBuf) -> io::Result<Self> {
         let mut tree = Self {
             root,
-            focused: true,
-            close_requested: false,
+            keymap: keymap!({ "File explorer"
+                "ret" => pane_activate,
+                "r" => pane_refresh,
+                "q" => pane_close,
+                "esc" | "tab" => focus_document_pane,
+                "home" => goto_file_start,
+                "end" | "G" => goto_last_line,
+            }),
             entries: Vec::new(),
             expanded: HashSet::new(),
             selected: 0,
             offset: 0,
             area: Rect::default(),
-            window_prefix: false,
-            space_prefix: false,
             git_status: git::Snapshot::default(),
             git_pending: None,
             git_last_refresh: None,
@@ -368,7 +371,7 @@ impl FileTree {
         }
     }
 
-    fn activate(&mut self, editor: &mut Editor) -> anyhow::Result<()> {
+    fn activate(&mut self) -> anyhow::Result<PaneOutcome> {
         if let Some(entry) = self.entries.get(self.selected) {
             if entry.directory {
                 if self.expanded.contains(&entry.path) {
@@ -377,128 +380,17 @@ impl FileTree {
                     self.expand()?;
                 }
             } else {
-                editor.open(&entry.path, Action::Replace)?;
-                self.focused = false;
+                return Ok(PaneOutcome::OpenFile(entry.path.clone(), Action::Replace));
             }
         }
-        Ok(())
-    }
-
-    /// Returns true when input belongs to the sidebar rather than the document.
-    pub fn handle_event(&mut self, event: &Event, editor: &mut Editor) -> bool {
-        if matches!(event, Event::FocusGained) {
-            self.request_git_refresh();
-        }
-        if let Event::Mouse(mouse) = event {
-            let inside = mouse.column >= self.area.x
-                && mouse.column < self.area.right()
-                && mouse.row >= self.area.y
-                && mouse.row < self.area.bottom();
-            if !inside {
-                if matches!(mouse.kind, MouseEventKind::Down(_)) {
-                    self.focused = false;
-                    self.window_prefix = false;
-                    self.space_prefix = false;
-                }
-                return false;
-            }
-            match mouse.kind {
-                MouseEventKind::Down(MouseButton::Left) => {
-                    editor.enter_normal_mode();
-                    if !self.focused {
-                        self.request_git_refresh();
-                    }
-                    self.focused = true;
-                    let row = mouse.row.saturating_sub(self.area.y + 1) as usize;
-                    self.selected = (self.offset + row).min(self.entries.len().saturating_sub(1));
-                }
-                MouseEventKind::ScrollDown => {
-                    self.selected = (self.selected + 3).min(self.entries.len().saturating_sub(1));
-                }
-                MouseEventKind::ScrollUp => self.selected = self.selected.saturating_sub(3),
-                _ => (),
-            }
-            return true;
-        }
-        if !self.focused {
-            return false;
-        }
-        let Event::Key(mut key) = *event else {
-            return matches!(event, Event::Paste(_));
-        };
-        super::editor::canonicalize_key(&mut key);
-        editor.reset_idle_timer();
-        if self.window_prefix {
-            self.window_prefix = false;
-            if matches!(
-                key,
-                key!('l') | key!(Right) | ctrl!('l') | key!('w') | ctrl!('w')
-            ) {
-                self.focused = false;
-            } else if matches!(key, key!('q') | ctrl!('q')) {
-                self.close_requested = true;
-            }
-            return true;
-        }
-        if self.space_prefix {
-            self.space_prefix = false;
-            self.window_prefix = key == key!('w');
-            self.close_requested = key == key!('E');
-            return true;
-        }
-        let result: anyhow::Result<()> = match key {
-            key!('j') | key!(Down) => {
-                self.selected = (self.selected + 1).min(self.entries.len().saturating_sub(1));
-                Ok(())
-            }
-            key!('k') | key!(Up) => {
-                self.selected = self.selected.saturating_sub(1);
-                Ok(())
-            }
-            key!('g') | key!(Home) => {
-                self.selected = 0;
-                Ok(())
-            }
-            key!('G') | key!(End) => {
-                self.selected = self.entries.len().saturating_sub(1);
-                Ok(())
-            }
-            key!('l') | key!(Right) => self.expand().map_err(Into::into),
-            key!('h') | key!(Left) => {
-                self.collapse();
-                Ok(())
-            }
-            key!(Enter) => self.activate(editor),
-            key!('r') => self.refresh().map_err(Into::into),
-            key!(Esc) | key!(Tab) => {
-                self.focused = false;
-                Ok(())
-            }
-            ctrl!('w') => {
-                self.window_prefix = true;
-                Ok(())
-            }
-            key!('q') => {
-                self.close_requested = true;
-                Ok(())
-            }
-            key!(' ') => {
-                self.space_prefix = true;
-                Ok(())
-            }
-            _ => Ok(()),
-        };
-        if let Err(error) = result {
-            editor.set_error(format!("File explorer: {error}"));
-        }
-        true
+        Ok(PaneOutcome::None)
     }
 
     pub fn request_git_refresh(&mut self) {
         self.git_refresh_requested = true;
     }
 
-    pub fn update_git_status(&mut self, editor: &Editor, jobs: &mut Jobs) {
+    pub fn update_git_status(&mut self, id: PaneId, editor: &Editor, jobs: &mut Jobs) {
         if !cfg!(feature = "git") || self.git_pending.is_some() {
             return;
         }
@@ -530,7 +422,7 @@ impl FileTree {
                 move |editor, compositor| {
                     let Some(tree) = compositor
                         .find::<super::EditorView>()
-                        .and_then(|editor| editor.file_tree_mut())
+                        .and_then(|editor| editor.panes.get_mut::<FileTree>(id))
                     else {
                         return;
                     };
@@ -563,10 +455,9 @@ impl FileTree {
         });
     }
 
-    pub fn render(&mut self, area: Rect, surface: &mut Surface, theme: &Theme) {
+    pub fn render(&mut self, area: Rect, surface: &mut Surface, theme: &Theme, focused: bool) {
         self.area = area;
         if area.width < 2 || area.height == 0 {
-            self.focused = false;
             return;
         }
         let height = area.height.saturating_sub(1) as usize;
@@ -612,7 +503,7 @@ impl FileTree {
             } else {
                 theme.get("ui.text")
             };
-            if self.focused && self.offset + row == self.selected {
+            if focused && self.offset + row == self.selected {
                 style = style
                     .patch(theme.get("ui.text.focus"))
                     .patch(theme.get("ui.selection"));
@@ -657,5 +548,64 @@ impl FileTree {
                 CursorKind::Hidden,
             )
         }
+    }
+}
+
+impl Pane for FileTree {
+    fn kind(&self) -> &'static str {
+        ID
+    }
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+    fn keymap(&self) -> &KeyTrie {
+        &self.keymap
+    }
+
+    fn command(&mut self, command: PaneCommand, count: usize) -> anyhow::Result<PaneOutcome> {
+        let last = self.entries.len().saturating_sub(1);
+        let page = (self.area.height.saturating_sub(1) as usize).saturating_mul(count);
+        match command {
+            PaneCommand::Up => self.selected = self.selected.saturating_sub(count),
+            PaneCommand::Down => self.selected = self.selected.saturating_add(count).min(last),
+            PaneCommand::Left => self.collapse(),
+            PaneCommand::Right => self.expand()?,
+            PaneCommand::First => self.selected = count.saturating_sub(1).min(last),
+            PaneCommand::Last => self.selected = last,
+            PaneCommand::PageUp => self.selected = self.selected.saturating_sub(page),
+            PaneCommand::PageDown => self.selected = self.selected.saturating_add(page).min(last),
+            PaneCommand::Activate => return self.activate(),
+            PaneCommand::Refresh => self.refresh()?,
+            PaneCommand::Close => return Ok(PaneOutcome::Close),
+            PaneCommand::FocusDocument => return Ok(PaneOutcome::FocusDocument),
+        }
+        Ok(PaneOutcome::None)
+    }
+
+    fn mouse(&mut self, mouse: &helix_view::input::MouseEvent, area: Rect) {
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) if mouse.row > area.y => {
+                let row = (mouse.row - area.y - 1) as usize;
+                self.selected = (self.offset + row).min(self.entries.len().saturating_sub(1));
+            }
+            MouseEventKind::ScrollDown => {
+                self.selected = (self.selected + 3).min(self.entries.len().saturating_sub(1))
+            }
+            MouseEventKind::ScrollUp => self.selected = self.selected.saturating_sub(3),
+            _ => (),
+        }
+    }
+
+    fn update(&mut self, id: PaneId, editor: &Editor, jobs: &mut Jobs) {
+        self.update_git_status(id, editor, jobs);
+    }
+    fn refresh(&mut self) {
+        self.request_git_refresh();
+    }
+    fn render(&mut self, area: Rect, surface: &mut Surface, editor: &Editor, focused: bool) {
+        self.render(area, surface, &editor.theme, focused);
+    }
+    fn cursor(&self, _area: Rect) -> (Option<Position>, CursorKind) {
+        self.cursor()
     }
 }

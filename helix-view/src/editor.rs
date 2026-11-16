@@ -1250,6 +1250,9 @@ pub struct Editor {
     /// Current editing mode.
     pub mode: Mode,
     pub tree: Tree,
+    /// Focused frontend pane. `None` means the document at `tree.focus` is active.
+    /// The document focus remains the target for opening files from other panes.
+    pub focused_pane: Option<crate::PaneId>,
     pub next_document_id: DocumentId,
     pub documents: BTreeMap<DocumentId, Document>,
 
@@ -1404,6 +1407,7 @@ impl Editor {
         Self {
             mode: Mode::Normal,
             tree: Tree::new(area),
+            focused_pane: None,
             next_document_id: DocumentId::default(),
             documents: BTreeMap::new(),
             saves: HashMap::new(),
@@ -1909,6 +1913,7 @@ impl Editor {
     }
 
     pub fn switch(&mut self, id: DocumentId, action: Action) {
+        self.focused_pane = None;
         use crate::tree::Layout;
 
         if !self.documents.contains_key(&id) {
@@ -2250,6 +2255,7 @@ impl Editor {
     }
 
     pub fn focus(&mut self, view_id: ViewId) {
+        self.focused_pane = None;
         if self.tree.focus == view_id {
             return;
         }

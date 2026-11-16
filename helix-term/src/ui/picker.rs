@@ -385,7 +385,10 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             query,
             truncate_start: true,
             show_preview: true,
-            callback_fn: Box::new(callback_fn),
+            callback_fn: Box::new(move |cx, item, action| {
+                callback_fn(cx, item, action);
+                None
+            }),
             default_action: Action::Replace,
             completion_height: 0,
             widths,
@@ -406,6 +409,17 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             picker_version: self.version.clone(),
             _redraw: helix_event::RequestRedrawOnDrop,
         }
+    }
+
+    /// Run a UI action synchronously after closing the picker, with access to
+    /// the compositor. Returning a callback avoids pushing a layer under a picker
+    /// that is about to be popped, without delaying commands through a job queue.
+    pub fn with_compositor_callback(
+        mut self,
+        callback: impl Fn(&mut Context, &T, Action) -> Option<compositor::Callback> + 'static,
+    ) -> Self {
+        self.callback_fn = Box::new(callback);
+        self
     }
 
     pub fn truncate_start(mut self, truncate_start: bool) -> Self {
@@ -1063,7 +1077,7 @@ impl<I: 'static + Send + Sync, D: 'static + Send + Sync> Component for Picker<I,
             _ => return EventResult::Ignored(None),
         };
 
-        let close_fn = |picker: &mut Self| {
+        let close_fn = |picker: &mut Self, after: Option<compositor::Callback>| {
             // if the picker is very large don't store it as last_picker to avoid
             // excessive memory consumption
             let callback: compositor::Callback =
@@ -1083,7 +1097,12 @@ impl<I: 'static + Send + Sync, D: 'static + Send + Sync> Component for Picker<I,
                         compositor.last_picker = compositor.pop();
                     })
                 };
-            EventResult::Consumed(Some(callback))
+            EventResult::Consumed(Some(Box::new(move |compositor, cx| {
+                callback(compositor, cx);
+                if let Some(after) = after {
+                    after(compositor, cx);
+                }
+            })))
         };
 
         match key_event {
@@ -1105,10 +1124,14 @@ impl<I: 'static + Send + Sync, D: 'static + Send + Sync> Component for Picker<I,
             key!(End) => {
                 self.to_end();
             }
-            key!(Esc) | ctrl!('c') => return close_fn(self),
+            key!(Esc) | ctrl!('c') => return close_fn(self, None),
             alt!(Enter) => {
                 if let Some(option) = self.selection() {
-                    (self.callback_fn)(ctx, option, self.default_action);
+                    return EventResult::Consumed((self.callback_fn)(
+                        ctx,
+                        option,
+                        self.default_action,
+                    ));
                 }
             }
             key!(Enter) => {
@@ -1131,9 +1154,9 @@ impl<I: 'static + Send + Sync, D: 'static + Send + Sync> Component for Picker<I,
                     // Inserting from the history register is a paste.
                     self.handle_prompt_change(true);
                 } else {
-                    if let Some(option) = self.selection() {
-                        (self.callback_fn)(ctx, option, self.default_action);
-                    }
+                    let after = self
+                        .selection()
+                        .and_then(|option| (self.callback_fn)(ctx, option, self.default_action));
                     if let Some(history_register) = self.prompt.history_register() {
                         if let Err(err) = ctx
                             .editor
@@ -1143,20 +1166,20 @@ impl<I: 'static + Send + Sync, D: 'static + Send + Sync> Component for Picker<I,
                             ctx.editor.set_error(err.to_string());
                         }
                     }
-                    return close_fn(self);
+                    return close_fn(self, after);
                 }
             }
             ctrl!('s') => {
-                if let Some(option) = self.selection() {
-                    (self.callback_fn)(ctx, option, Action::HorizontalSplit);
-                }
-                return close_fn(self);
+                let after = self
+                    .selection()
+                    .and_then(|option| (self.callback_fn)(ctx, option, Action::HorizontalSplit));
+                return close_fn(self, after);
             }
             ctrl!('v') => {
-                if let Some(option) = self.selection() {
-                    (self.callback_fn)(ctx, option, Action::VerticalSplit);
-                }
-                return close_fn(self);
+                let after = self
+                    .selection()
+                    .and_then(|option| (self.callback_fn)(ctx, option, Action::VerticalSplit));
+                return close_fn(self, after);
             }
             ctrl!('t') => {
                 self.toggle_preview();
@@ -1204,4 +1227,4 @@ impl<T: 'static + Send + Sync, D> Drop for Picker<T, D> {
     }
 }
 
-type PickerCallback<T> = Box<dyn Fn(&mut Context, &T, Action)>;
+type PickerCallback<T> = Box<dyn Fn(&mut Context, &T, Action) -> Option<compositor::Callback>>;
