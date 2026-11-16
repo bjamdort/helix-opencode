@@ -296,6 +296,7 @@ This layer is a kludge of mappings, mostly pickers.
 | `f`     | Open file picker at LSP workspace root                                  | `file_picker`                              |
 | `F`     | Open file picker at current working directory                           | `file_picker_in_current_directory`         |
 | `e`     | Open file explorer at workspace root                                     | `file_explorer`                            |
+| `E`     | Toggle file explorer sidebar                                             | `toggle_file_explorer`                     |
 | `.`     | Open file explorer at current buffer's directory                        | `file_explorer_in_current_buffer_directory`|
 | `b`     | Open buffer picker                                                      | `buffer_picker`                            |
 | `j`     | Open jumplist picker                                                    | `jumplist_picker`                          |
@@ -323,6 +324,62 @@ This layer is a kludge of mappings, mostly pickers.
 | `?`     | Open command palette                                                    | `command_palette`                          |
 
 > 💡 Global search displays results in a fuzzy picker, use `Space + '` to bring it back up after opening a file.
+
+##### File explorer
+
+The file explorer opens as a persistent sidebar on the left. `Space e` opens or
+focuses it at the workspace root, and `Space .` opens it at the current buffer's
+directory. Opening a file keeps the sidebar visible and returns focus to the editor.
+
+Use `Ctrl-w h` from the leftmost editor split to focus the sidebar. Use `Ctrl-w l`,
+`Tab`, or `Esc` in the sidebar to return to the editor. `Space w h` and `Space w l`
+also switch focus.
+
+| Key              | Description                                  |
+| ----             | -----------                                  |
+| `j`, `Down`      | Select next entry                            |
+| `k`, `Up`        | Select previous entry                        |
+| `h`, `Left`      | Collapse directory or select parent          |
+| `l`, `Right`     | Expand directory                             |
+| `Enter`          | Open file or toggle directory                |
+| `g`, `Home`      | Select first entry                           |
+| `G`, `End`       | Select last entry                            |
+| `r`              | Refresh tree                                 |
+| `q`, `Space E`   | Close sidebar                                |
+
+Click an entry to select it, then press `Enter` to open it. The sidebar shows
+hidden files and does not expand directory symlinks. On terminals narrower than
+20 columns, the sidebar is hidden to leave room for the editor.
+
+Folder and file-type icons use Nerd Font glyphs. Configure your terminal to use a
+Nerd Font to display them. Folder icons change when expanded; unrecognized file
+types use a generic file icon.
+
+Git status colors use your theme's diff colors. The marker at the right of each
+entry identifies its status:
+
+| Marker | Status                       | Theme scope             |
+| ------ | ------                       | -----------             |
+| `A`    | Added to the index           | `diff.plus`             |
+| `?`    | Untracked                    | `diff.plus`             |
+| `M`    | Modified or file type changed | `diff.delta`           |
+| `R`    | Renamed                      | `diff.delta.moved`      |
+| `D`    | Deleted                      | `diff.minus`           |
+| `U`    | Merge conflict               | `diff.delta.conflict`  |
+| `!`    | Ignored                      | `ui.text.inactive`     |
+
+Both staged and unstaged changes are included. Folders and the root header
+summarize changes inside them, prioritizing conflicts, deletions, modifications,
+renames, additions, and untracked files, in that order. Deleted files no longer
+appear in the filesystem tree, but their remaining parent folders and the root
+header show the deletion status. Ignored files do not mark their parents as changed.
+
+Status is read from disk in the background when you open or focus the explorer,
+regain terminal focus, or redraw after at least two seconds since the last status
+read. Press `r` to refresh immediately. Unsaved buffer edits are not Git changes
+until you save them. This feature requires Git on `PATH` and a workspace trusted
+for Git integration (`:workspace-trust`); otherwise the tree works without Git
+decorations.
 
 ##### Popup
 

@@ -36,6 +36,7 @@ use std::{mem::take, num::NonZeroUsize, ops, path::PathBuf, rc::Rc};
 use tui::{buffer::Buffer as Surface, text::Span};
 
 pub struct EditorView {
+    file_tree: Option<super::file_tree::FileTree>,
     pub keymaps: Keymaps,
     on_next_key: Option<(OnKeyCallback, OnKeyCallbackKind)>,
     pseudo_pending: Vec<KeyEvent>,
@@ -60,6 +61,7 @@ pub enum InsertEvent {
 impl EditorView {
     pub fn new(keymaps: Keymaps) -> Self {
         Self {
+            file_tree: None,
             keymaps,
             on_next_key: None,
             pseudo_pending: Vec::new(),
@@ -72,6 +74,36 @@ impl EditorView {
 
     pub fn spinners_mut(&mut self) -> &mut ProgressSpinners {
         &mut self.spinners
+    }
+
+    pub fn open_file_tree(&mut self, root: PathBuf) -> std::io::Result<()> {
+        if let Some(tree) = self.file_tree.as_mut().filter(|tree| tree.root == root) {
+            tree.focused = true;
+            tree.request_git_refresh();
+        } else {
+            self.file_tree = Some(super::file_tree::FileTree::new(root)?);
+        }
+        Ok(())
+    }
+
+    pub fn toggle_file_tree(&mut self, root: PathBuf) -> std::io::Result<()> {
+        if self.file_tree.is_some() {
+            self.file_tree = None;
+            Ok(())
+        } else {
+            self.open_file_tree(root)
+        }
+    }
+
+    pub fn focus_file_tree(&mut self) {
+        if let Some(tree) = &mut self.file_tree {
+            tree.focused = true;
+            tree.request_git_refresh();
+        }
+    }
+
+    pub(super) fn file_tree_mut(&mut self) -> Option<&mut super::file_tree::FileTree> {
+        self.file_tree.as_mut()
     }
 
     pub fn render_view(
@@ -1447,6 +1479,14 @@ impl Component for EditorView {
         event: &Event,
         context: &mut crate::compositor::Context,
     ) -> EventResult {
+        if let Some(tree) = &mut self.file_tree {
+            if tree.handle_event(event, context.editor) {
+                if tree.close_requested {
+                    self.file_tree = None;
+                }
+                return EventResult::Consumed(None);
+            }
+        }
         let mut cx = commands::Context {
             editor: context.editor,
             count: None,
@@ -1629,6 +1669,21 @@ impl Component for EditorView {
             editor_area = editor_area.clip_top(1);
         }
 
+        let sidebar_width = if self.file_tree.is_some() && editor_area.width >= 20 {
+            (editor_area.width / 3).min(32)
+        } else {
+            0
+        };
+        if let Some(tree) = &mut self.file_tree {
+            tree.update_git_status(cx.editor, cx.jobs);
+            tree.render(
+                editor_area.with_width(sidebar_width),
+                surface,
+                &cx.editor.theme,
+            );
+        }
+        editor_area = editor_area.clip_left(sidebar_width);
+
         // if the terminal size suddenly changed, we need to trigger a resize
         cx.editor.resize(editor_area);
 
@@ -1638,7 +1693,15 @@ impl Component for EditorView {
 
         for (view, is_focused) in cx.editor.tree.views() {
             let doc = cx.editor.document(view.doc).unwrap();
-            self.render_view(cx.editor, doc, view, area, surface, is_focused);
+            let tree_focused = self.file_tree.as_ref().is_some_and(|tree| tree.focused);
+            self.render_view(
+                cx.editor,
+                doc,
+                view,
+                area,
+                surface,
+                is_focused && !tree_focused,
+            );
         }
 
         if config.auto_info {
@@ -1730,6 +1793,9 @@ impl Component for EditorView {
     }
 
     fn cursor(&self, _area: Rect, editor: &Editor) -> (Option<Position>, CursorKind) {
+        if let Some(tree) = self.file_tree.as_ref().filter(|tree| tree.focused) {
+            return tree.cursor();
+        }
         match editor.cursor() {
             // all block cursors are drawn manually
             (pos, CursorKind::Block) => {
@@ -1745,7 +1811,7 @@ impl Component for EditorView {
     }
 }
 
-fn canonicalize_key(key: &mut KeyEvent) {
+pub(super) fn canonicalize_key(key: &mut KeyEvent) {
     if let KeyEvent {
         code: KeyCode::Char(_),
         modifiers: _,

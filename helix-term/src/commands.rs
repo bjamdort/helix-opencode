@@ -404,6 +404,7 @@ impl MappableCommand {
         file_picker_in_current_buffer_directory, "Open file picker at current buffer's directory",
         file_picker_in_current_directory, "Open file picker at current working directory",
         file_explorer, "Open file explorer in workspace root",
+        toggle_file_explorer, "Toggle the file explorer sidebar",
         file_explorer_in_current_buffer_directory, "Open file explorer at current buffer's directory",
         file_explorer_in_current_directory, "Open file explorer at current working directory",
         code_action, "Perform code action",
@@ -3221,9 +3222,30 @@ fn file_explorer(cx: &mut Context) {
         return;
     }
 
-    if let Ok(picker) = ui::file_explorer(root, cx.editor) {
-        cx.push_layer(Box::new(overlaid(picker)));
-    }
+    open_file_tree(cx, root);
+}
+
+fn open_file_tree(cx: &mut Context, root: PathBuf) {
+    cx.editor.enter_normal_mode();
+    cx.callback.push(Box::new(move |compositor, cx| {
+        if let Some(editor) = compositor.find::<ui::EditorView>() {
+            if let Err(error) = editor.open_file_tree(root) {
+                cx.editor.set_error(format!("File explorer: {error}"));
+            }
+        }
+    }));
+}
+
+fn toggle_file_explorer(cx: &mut Context) {
+    let root = find_workspace().0;
+    cx.editor.enter_normal_mode();
+    cx.callback.push(Box::new(move |compositor, cx| {
+        if let Some(editor) = compositor.find::<ui::EditorView>() {
+            if let Err(error) = editor.toggle_file_tree(root) {
+                cx.editor.set_error(format!("File explorer: {error}"));
+            }
+        }
+    }));
 }
 
 fn file_explorer_in_current_buffer_directory(cx: &mut Context) {
@@ -3248,9 +3270,7 @@ fn file_explorer_in_current_buffer_directory(cx: &mut Context) {
         }
     };
 
-    if let Ok(picker) = ui::file_explorer(path, cx.editor) {
-        cx.push_layer(Box::new(overlaid(picker)));
-    }
+    open_file_tree(cx, path);
 }
 
 fn file_explorer_in_current_directory(cx: &mut Context) {
@@ -3261,9 +3281,7 @@ fn file_explorer_in_current_directory(cx: &mut Context) {
         return;
     }
 
-    if let Ok(picker) = ui::file_explorer(cwd, cx.editor) {
-        cx.push_layer(Box::new(overlaid(picker)));
-    }
+    open_file_tree(cx, cwd);
 }
 
 struct PathStyleConfig {
@@ -5933,7 +5951,16 @@ fn jump_view_right(cx: &mut Context) {
 }
 
 fn jump_view_left(cx: &mut Context) {
-    cx.editor.focus_direction(tree::Direction::Left)
+    let previous = cx.editor.tree.focus;
+    cx.editor.focus_direction(tree::Direction::Left);
+    if cx.editor.tree.focus == previous {
+        cx.editor.enter_normal_mode();
+        cx.callback.push(Box::new(|compositor, _cx| {
+            if let Some(editor) = compositor.find::<ui::EditorView>() {
+                editor.focus_file_tree();
+            }
+        }));
+    }
 }
 
 fn jump_view_up(cx: &mut Context) {
