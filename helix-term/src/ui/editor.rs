@@ -115,6 +115,44 @@ impl EditorView {
         }
     }
 
+    pub(crate) fn toggle_opencode(
+        &mut self,
+        directory: PathBuf,
+        editor: &mut Editor,
+    ) -> anyhow::Result<()> {
+        if let Some(id) = self.panes.find(super::opencode::ID) {
+            self.panes.remove(id, editor);
+            Ok(())
+        } else {
+            self.open_opencode(directory, None, editor)
+        }
+    }
+
+    pub(crate) fn open_opencode(
+        &mut self,
+        directory: PathBuf,
+        session: Option<String>,
+        editor: &mut Editor,
+    ) -> anyhow::Result<()> {
+        if let Some(id) = self.panes.find(super::opencode::ID) {
+            if let Some(session) = session {
+                let pane = self.panes.get_mut::<super::opencode::OpenCode>(id).unwrap();
+                if pane.session_id != session {
+                    *pane = super::opencode::OpenCode::new(directory, Some(session))?;
+                }
+            }
+            self.panes.focus_pane(id, editor);
+        } else {
+            self.panes.insert(
+                super::opencode::OpenCode::new(directory, session)?,
+                super::pane::Dock::Right,
+                64,
+                editor,
+            );
+        }
+        Ok(())
+    }
+
     fn sync_pane_focus(&mut self, editor: &mut Editor) {
         if self.keymap_pane != editor.focused_pane {
             self.keymap_pane = editor.focused_pane;

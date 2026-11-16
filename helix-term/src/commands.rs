@@ -420,7 +420,20 @@ impl MappableCommand {
         file_picker_in_current_directory, "Open file picker at current working directory",
         file_explorer, "Open file explorer in workspace root",
         toggle_file_explorer, "Toggle the file explorer sidebar",
+        opencode_chat, "Toggle the OpenCode chat pane",
         pane_activate, "Activate the selected pane item",
+        pane_compose, "Compose a message in the focused pane",
+        pane_interrupt, "Interrupt the focused pane's operation",
+        pane_new, "Start a new conversation in the focused pane",
+        pane_toggle_details, "Toggle details in the focused pane",
+        pane_requests, "Inspect pending pane requests",
+        pane_review, "Review the chat session's latest changes",
+        pane_next_reference, "Select the next file reference in the pane",
+        pane_previous_reference, "Select the previous file reference in the pane",
+        pane_open_reference, "Open the selected file reference",
+        pane_references, "List file references in the pane",
+        pane_next_message, "Jump to the next chat message",
+        pane_previous_message, "Jump to the previous chat message",
         pane_refresh, "Refresh the focused pane",
         pane_close, "Close the focused pane",
         focus_document_pane, "Focus the last document pane",
@@ -748,6 +761,74 @@ fn pane_activate(cx: &mut Context) {
 
 fn pane_refresh(cx: &mut Context) {
     cx.editor.set_error("No auxiliary pane is focused");
+}
+
+fn pane_compose(cx: &mut Context) {
+    cx.editor.set_error("No chat pane is focused");
+}
+fn pane_interrupt(cx: &mut Context) {
+    cx.editor.set_error("No chat pane is focused");
+}
+fn pane_new(cx: &mut Context) {
+    cx.editor.set_error("No chat pane is focused");
+}
+fn pane_toggle_details(cx: &mut Context) {
+    cx.editor.set_error("No auxiliary pane is focused");
+}
+fn pane_requests(cx: &mut Context) {
+    cx.editor.set_error("No chat pane is focused");
+}
+fn pane_review(cx: &mut Context) {
+    cx.editor.set_error("No chat pane is focused");
+}
+fn pane_next_reference(cx: &mut Context) {
+    cx.editor.set_error("No chat pane is focused");
+}
+fn pane_previous_reference(cx: &mut Context) {
+    cx.editor.set_error("No chat pane is focused");
+}
+fn pane_open_reference(cx: &mut Context) {
+    cx.editor.set_error("No chat pane is focused");
+}
+fn pane_references(cx: &mut Context) {
+    cx.editor.set_error("No chat pane is focused");
+}
+fn pane_next_message(cx: &mut Context) {
+    cx.editor.set_error("No chat pane is focused");
+}
+fn pane_previous_message(cx: &mut Context) {
+    cx.editor.set_error("No chat pane is focused");
+}
+
+fn opencode_chat(cx: &mut Context) {
+    let directory = doc!(cx.editor).workspace_root().to_owned();
+    cx.callback.push(Box::new(move |compositor, cx| {
+        if let Some(view) = compositor.find::<ui::EditorView>() {
+            if let Err(error) = view.toggle_opencode(directory, cx.editor) {
+                cx.editor.set_error(error.to_string());
+            }
+        }
+    }));
+}
+
+pub(super) fn opencode_callback(
+    editor: &Editor,
+    session: Option<String>,
+) -> anyhow::Result<compositor::Callback> {
+    if session
+        .as_deref()
+        .is_some_and(|id| !crate::opencode::valid_id(id, "ses"))
+    {
+        bail!("Invalid OpenCode session ID");
+    }
+    let directory = doc!(editor).workspace_root().to_owned();
+    Ok(Box::new(move |compositor, cx| {
+        if let Some(view) = compositor.find::<ui::EditorView>() {
+            if let Err(error) = view.open_opencode(directory, session, cx.editor) {
+                cx.editor.set_error(error.to_string());
+            }
+        }
+    }))
 }
 
 fn pane_close(cx: &mut Context) {

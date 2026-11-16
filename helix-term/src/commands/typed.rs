@@ -2997,6 +2997,56 @@ const WRITE_NO_CODE_ACTIONS_FLAG: Flag = Flag {
 
 pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     TypableCommand {
+        name: "opencode-selection",
+        aliases: &[],
+        doc: "Comment on editor selections in the bottom input row, then attach them to OpenCode without saving.",
+        fun: |_, _, _| Ok(()),
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, None),
+            flags: &[Flag {
+                name: "comment",
+                alias: Some('c'),
+                doc: "prefill the selection comment input, separately from the chat message",
+                completions: Some(&[]),
+            }],
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "opencode-comment",
+        aliases: &[],
+        doc: "Select a staged OpenCode snippet and edit its reference comment without sending.",
+        fun: |_, _, _| Ok(()),
+        completer: CommandCompleter::none(),
+        signature: Signature { positionals: (0, Some(0)), ..Signature::DEFAULT },
+    },
+    TypableCommand {
+        name: "opencode-clear-context",
+        aliases: &[],
+        doc: "Remove staged OpenCode snippets without clearing the message draft.",
+        fun: |_, _, _| Ok(()),
+        completer: CommandCompleter::none(),
+        signature: Signature { positionals: (0, Some(0)), ..Signature::DEFAULT },
+    },
+    TypableCommand {
+        name: "opencode-model",
+        aliases: &[],
+        doc: "Select the current OpenCode session's model and variant.",
+        fun: |_, _, _| Ok(()),
+        completer: CommandCompleter::none(),
+        signature: Signature { positionals: (0, Some(0)), ..Signature::DEFAULT },
+    },
+    TypableCommand {
+        name: "opencode",
+        aliases: &[],
+        doc: "Open OpenCode chat, optionally attaching an existing session ID.",
+        // UI commands return their compositor action from execute_command.
+        fun: |_, _, _| Ok(()),
+        completer: CommandCompleter::none(),
+        signature: Signature { positionals: (0, Some(1)), ..Signature::DEFAULT },
+    },
+    TypableCommand {
         name: "exit",
         aliases: &["x", "xit"],
         doc: "Write changes to disk if the buffer is modified and then quit. Accepts an optional path (:exit some/path.txt).",
@@ -4172,6 +4222,36 @@ pub(super) fn execute_command(
             return Ok(Some(super::pane::close_callback(target)));
         }
         return Ok(None);
+    }
+    if cmd.name == "opencode-selection" {
+        return if event == PromptEvent::Validate {
+            Ok(Some(ui::opencode_selection_callback(
+                cx.editor,
+                args.join(" "),
+                args.get_flag("comment").unwrap_or_default().to_owned(),
+            )?))
+        } else {
+            Ok(None)
+        };
+    }
+    if cmd.name == "opencode-clear-context" {
+        return Ok((event == PromptEvent::Validate).then(ui::opencode_clear_context_callback));
+    }
+    if cmd.name == "opencode-comment" {
+        return Ok((event == PromptEvent::Validate).then(ui::opencode_comment_callback));
+    }
+    if cmd.name == "opencode-model" {
+        return Ok((event == PromptEvent::Validate).then(ui::opencode_model_callback));
+    }
+    if cmd.name == "opencode" {
+        return if event == PromptEvent::Validate {
+            Ok(Some(super::opencode_callback(
+                cx.editor,
+                args.first().map(str::to_owned),
+            )?))
+        } else {
+            Ok(None)
+        };
     }
     (cmd.fun)(cx, args, event).map_err(|err| anyhow!("'{}': {err}", cmd.name))?;
     Ok(None)

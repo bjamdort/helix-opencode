@@ -578,6 +578,20 @@ impl Pane for FileTree {
             PaneCommand::Refresh => self.refresh()?,
             PaneCommand::Close => return Ok(PaneOutcome::Close),
             PaneCommand::FocusDocument => return Ok(PaneOutcome::FocusDocument),
+            PaneCommand::Compose
+            | PaneCommand::Interrupt
+            | PaneCommand::New
+            | PaneCommand::ToggleDetails
+            | PaneCommand::Requests
+            | PaneCommand::Review
+            | PaneCommand::NextReference
+            | PaneCommand::PreviousReference
+            | PaneCommand::OpenReference
+            | PaneCommand::References
+            | PaneCommand::NextMessage
+            | PaneCommand::PreviousMessage => {
+                anyhow::bail!("This action is not supported by the file explorer")
+            }
         }
         Ok(PaneOutcome::None)
     }

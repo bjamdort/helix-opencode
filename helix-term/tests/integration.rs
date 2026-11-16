@@ -20,5 +20,6 @@ mod test {
     mod commands;
     mod file_tree;
     mod movement;
+    mod opencode;
     mod splits;
 }

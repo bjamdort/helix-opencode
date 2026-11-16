@@ -19,7 +19,17 @@ pub(crate) enum PaneOutcome {
     None,
     Close,
     FocusDocument,
+    Overlay(Box<dyn crate::compositor::Component>),
     OpenFile(std::path::PathBuf, Action),
+    OpenFileAt {
+        path: std::path::PathBuf,
+        position: Option<Position>,
+    },
+    Compose {
+        title: &'static str,
+        draft: std::sync::Arc<parking_lot::Mutex<String>>,
+        anchor: Option<super::prompt::SharedPromptAnchor>,
+    },
 }
 
 /// Content-specific behavior only: no global key decoding or focus ownership.
@@ -27,6 +37,12 @@ pub(crate) trait Pane: Any {
     fn kind(&self) -> &'static str;
     fn as_any_mut(&mut self) -> &mut dyn Any;
     fn keymap(&self) -> &KeyTrie;
+    fn max_width(&self, available: u16) -> u16 {
+        available / 3
+    }
+    fn submit(&mut self, _text: String) -> anyhow::Result<()> {
+        anyhow::bail!("This pane does not accept text");
+    }
     fn command(&mut self, command: PaneCommand, count: usize) -> anyhow::Result<PaneOutcome>;
     fn mouse(&mut self, event: &MouseEvent, area: Rect);
     fn update(&mut self, id: PaneId, editor: &Editor, jobs: &mut Jobs);
@@ -38,7 +54,6 @@ pub(crate) trait Pane: Any {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Dock {
     Left,
-    #[allow(dead_code)] // Available to future pane types, not used by the explorer.
     Right,
 }
 
@@ -140,7 +155,7 @@ impl PaneManager {
     pub fn layout(&mut self, mut area: Rect, focused: &mut Option<PaneId>) -> Rect {
         for (id, pane) in &mut self.panes {
             let width = if area.width >= 20 {
-                pane.width.min(area.width / 3)
+                pane.width.min(pane.content.max_width(area.width))
             } else {
                 0
             };
@@ -208,35 +223,93 @@ impl PaneManager {
         }
     }
 
-    pub fn command(&mut self, command: PaneCommand, count: usize, editor: &mut Editor) {
-        let Some(id) = editor.focused_pane else {
-            return;
-        };
+    pub fn command(
+        &mut self,
+        command: PaneCommand,
+        count: usize,
+        editor: &mut Editor,
+    ) -> Option<crate::compositor::Callback> {
+        let id = editor.focused_pane?;
         match command {
             PaneCommand::Close => {
                 self.remove(id, editor);
-                return;
+                return None;
             }
             PaneCommand::FocusDocument => {
                 self.focus_document(editor);
-                return;
+                return None;
             }
             _ => (),
         }
         let Some(pane) = self.panes.get_mut(id) else {
             editor.focused_pane = None;
-            return;
+            return None;
         };
         match pane.content.command(command, count) {
             Ok(PaneOutcome::None) => (),
             Ok(PaneOutcome::Close) => self.remove(id, editor),
             Ok(PaneOutcome::FocusDocument) => self.focus_document(editor),
+            Ok(PaneOutcome::Overlay(component)) => {
+                return Some(Box::new(move |compositor, _| {
+                    compositor.push(component);
+                }))
+            }
             Ok(PaneOutcome::OpenFile(path, action)) => match editor.open(&path, action) {
                 Ok(_) => self.focus_document(editor),
                 Err(error) => editor.set_error(error.to_string()),
             },
+            Ok(PaneOutcome::OpenFileAt { path, position }) => {
+                match super::opencode::references::open_file(editor, &path, position) {
+                    Ok(()) => self.focus_document(editor),
+                    Err(error) => editor.set_error(error.to_string()),
+                }
+            }
+            Ok(PaneOutcome::Compose {
+                title,
+                draft,
+                anchor,
+            }) => {
+                return Some(Box::new(move |compositor, cx| {
+                    let initial = draft.lock().clone();
+                    let updates = draft.clone();
+                    let mut prompt = super::Prompt::new(
+                        if anchor.is_some() {
+                            "".into()
+                        } else {
+                            title.into()
+                        },
+                        None,
+                        |_, _| Vec::new(),
+                        move |_, text, _| {
+                            *updates.lock() = text.to_owned();
+                        },
+                    )
+                    .with_line(initial, cx.editor)
+                    .with_validate_callback(move |_, text| {
+                        let text = text.to_owned();
+                        *draft.lock() = text.clone();
+                        let draft = draft.clone();
+                        Some(Box::new(move |compositor, cx| {
+                            let result = compositor
+                                .find::<super::EditorView>()
+                                .and_then(|view| view.panes.panes.get_mut(id))
+                                .ok_or_else(|| anyhow::anyhow!("The pane has closed"))
+                                .and_then(|pane| pane.content.submit(text));
+                            match result {
+                                Ok(()) => draft.lock().clear(),
+                                Err(error) => cx.editor.set_error(error.to_string()),
+                            }
+                        }))
+                    });
+                    if let Some(anchor) = anchor {
+                        prompt = prompt.with_anchor(anchor);
+                    }
+                    compositor.push(Box::new(prompt));
+                }))
+            }
             Err(error) => editor.set_error(format!("{}: {error}", pane.content.kind())),
         }
+        None
     }
 
     fn targets(&self, editor: &Editor) -> Vec<(FocusTarget, Rect)> {

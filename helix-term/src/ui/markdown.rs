@@ -143,6 +143,15 @@ pub struct Markdown {
     config_loader: Arc<ArcSwap<syntax::Loader>>,
 }
 
+/// A rendered prose/code span, with its enclosing link destination when present.
+/// Code blocks and image labels are deliberately excluded.
+pub(super) struct InlineSpan {
+    pub line: usize,
+    pub span: usize,
+    pub destination: Option<String>,
+    pub code: bool,
+}
+
 // TODO: pre-render and self reference via Pin
 // better yet, just use Tendril + subtendril for references
 
@@ -170,6 +179,13 @@ impl Markdown {
     }
 
     pub fn parse(&self, theme: Option<&Theme>) -> tui::text::Text<'_> {
+        self.parse_with_inline(theme).0
+    }
+
+    pub(super) fn parse_with_inline(
+        &self,
+        theme: Option<&Theme>,
+    ) -> (tui::text::Text<'_>, Vec<InlineSpan>) {
         fn push_line<'a>(spans: &mut Vec<Span<'a>>, lines: &mut Vec<Spans<'a>>) {
             let spans = std::mem::take(spans);
             if !spans.is_empty() {
@@ -186,6 +202,7 @@ impl Markdown {
         let mut spans = Vec::new();
         let mut lines = Vec::new();
         let mut list_stack = Vec::new();
+        let mut inline = Vec::new();
 
         let get_indent = |level: usize| {
             if level < 1 {
@@ -224,6 +241,21 @@ impl Markdown {
         });
 
         for event in parser {
+            if matches!(event, Event::Text(_) | Event::Code(_))
+                && !tags
+                    .iter()
+                    .any(|tag| matches!(tag, Tag::CodeBlock(_) | Tag::Image { .. }))
+            {
+                inline.push(InlineSpan {
+                    line: lines.len(),
+                    span: spans.len(),
+                    destination: tags.iter().rev().find_map(|tag| match tag {
+                        Tag::Link { dest_url, .. } => Some(dest_url.to_string()),
+                        _ => None,
+                    }),
+                    code: matches!(event, Event::Code(_)),
+                });
+            }
             match event {
                 Event::Start(Tag::List(list)) => {
                     // if the list stack is not empty this is a sub list, in that
@@ -361,7 +393,7 @@ impl Markdown {
             }
         }
 
-        Text::from(lines)
+        (Text::from(lines), inline)
     }
 }
 

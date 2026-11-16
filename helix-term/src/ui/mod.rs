@@ -6,6 +6,13 @@ mod info;
 pub mod lsp;
 mod markdown;
 pub mod menu;
+mod opencode;
+pub(crate) use opencode::models::callback as opencode_model_callback;
+pub(crate) use opencode::snippets::{
+    clear_callback as opencode_clear_context_callback,
+    comment_callback as opencode_comment_callback,
+    selection_callback as opencode_selection_callback,
+};
 pub mod overlay;
 pub(crate) mod pane;
 pub mod picker;
@@ -26,6 +33,16 @@ use helix_stdx::rope;
 use helix_view::theme::Style;
 pub use markdown::Markdown;
 pub use menu::Menu;
+// Exercise the production opener with a real Editor without contacting a service.
+#[cfg(feature = "integration")]
+#[doc(hidden)]
+pub use self::opencode::references::open_file as test_open_chat_reference;
+#[cfg(feature = "integration")]
+#[doc(hidden)]
+pub fn test_capture_opencode_selection(editor: &Editor) -> anyhow::Result<serde_json::Value> {
+    let snippets = crate::opencode::snippets::capture(editor)?;
+    crate::opencode::snippets::prompt("msg_selection_test", "Review the selection", &snippets)
+}
 pub use picker::{Column as PickerColumn, FileLocation, Picker};
 pub use popup::Popup;
 pub use prompt::{Prompt, PromptEvent};

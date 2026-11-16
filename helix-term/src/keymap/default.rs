@@ -227,6 +227,7 @@ pub fn default() -> HashMap<Mode, KeyTrie> {
             "F" => file_picker_in_current_directory,
             "e" => file_explorer,
             "E" => toggle_file_explorer,
+            "o" => opencode_chat,
             "." => file_explorer_in_current_buffer_directory,
             "b" => buffer_picker,
             "j" => jumplist_picker,

@@ -16,6 +16,18 @@ pub(crate) enum PaneCommand {
     Refresh,
     Close,
     FocusDocument,
+    Compose,
+    Interrupt,
+    New,
+    ToggleDetails,
+    Requests,
+    Review,
+    NextReference,
+    PreviousReference,
+    OpenReference,
+    References,
+    NextMessage,
+    PreviousMessage,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,12 +61,25 @@ pub(crate) fn scope(command: &MappableCommand) -> CommandScope {
             Pane(PaneCommand::PageDown)
         }
         "pane_activate" => Pane(PaneCommand::Activate),
+        "pane_compose" => Pane(PaneCommand::Compose),
+        "pane_interrupt" => Pane(PaneCommand::Interrupt),
+        "pane_new" => Pane(PaneCommand::New),
+        "pane_toggle_details" => Pane(PaneCommand::ToggleDetails),
+        "pane_requests" => Pane(PaneCommand::Requests),
+        "pane_review" => Pane(PaneCommand::Review),
+        "pane_next_reference" => Pane(PaneCommand::NextReference),
+        "pane_previous_reference" => Pane(PaneCommand::PreviousReference),
+        "pane_open_reference" => Pane(PaneCommand::OpenReference),
+        "pane_references" => Pane(PaneCommand::References),
+        "pane_next_message" => Pane(PaneCommand::NextMessage),
+        "pane_previous_message" => Pane(PaneCommand::PreviousMessage),
         "pane_refresh" => Pane(PaneCommand::Refresh),
         "pane_close" => Pane(PaneCommand::Close),
         "focus_document_pane" => Pane(PaneCommand::FocusDocument),
         "no_op"
         | "command_mode"
         | "command_palette"
+        | "opencode_chat"
         | "file_explorer"
         | "file_explorer_in_current_buffer_directory"
         | "file_explorer_in_current_directory"
@@ -93,7 +118,10 @@ pub(crate) fn dispatch(cx: &mut Context, command: PaneCommand) {
             return;
         }
         if let Some(view) = compositor.find::<EditorView>() {
-            view.panes.command(command, count, cx.editor);
+            let callback = view.panes.command(command, count, cx.editor);
+            if let Some(callback) = callback {
+                callback(compositor, cx);
+            }
         }
     }));
 }
@@ -104,7 +132,7 @@ pub(crate) fn close_callback(target: helix_view::PaneId) -> compositor::Callback
             return;
         }
         if let Some(view) = compositor.find::<EditorView>() {
-            view.panes.command(PaneCommand::Close, 1, cx.editor);
+            let _ = view.panes.command(PaneCommand::Close, 1, cx.editor);
         }
     })
 }
@@ -151,5 +179,9 @@ pub(crate) fn typed_is_workspace(name: &str) -> bool {
             | "clear-register"
             | "set-register"
             | "run-shell-command"
+            | "opencode"
+            | "opencode-model"
+            | "opencode-clear-context"
+            | "opencode-comment"
     )
 }

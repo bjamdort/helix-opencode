@@ -1,7 +1,7 @@
 # Frontend panes
 
 The terminal frontend supports non-document panes through `ui::pane::Pane` and
-`PaneManager`. The file explorer is the first implementation. This is separate
+`PaneManager`. The file explorer and OpenCode chat implement this interface. This is separate
 from the compositor's modal layers: prompts and pickers temporarily overlay the
 focused pane instead of participating in its layout.
 
@@ -44,6 +44,19 @@ Pane actions translate shared movement commands into content-specific behavior.
 The host handles file-open, close, and focus outcomes. Panes must not decode
 global key prefixes or keep their own focus flags. Bracketed paste does not fall
 through to a document when an auxiliary pane has focus.
+
+Panes can also return a `Compose` outcome with a shared draft and an optional
+layout anchor. The host opens a Helix line editor inside that anchor (or on the
+command line when no anchor is provided) and routes validated input back to
+`Pane::submit`; cancellation and failed submission retain the draft. This keeps chat composition separate from
+document insert mode. A pane can override `max_width` to reserve a different
+portion of the docked area without changing document layout handling.
+
+An `Overlay` outcome opens a compositor component for inspections or structured
+interactions. OpenCode uses pane-local overlays for permission decisions, forms,
+and diff review. These modals consume input rather than forwarding unhandled
+keys to background documents. Opening or rendering an overlay must not imply
+consent to a remote operation.
 
 Palette actions run synchronously after the picker closes, using the picker's
 compositor callback. This preserves commands that create prompts or enqueue

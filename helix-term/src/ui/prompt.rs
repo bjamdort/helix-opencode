@@ -5,6 +5,7 @@ use helix_core::syntax;
 use helix_view::document::Mode;
 use helix_view::input::KeyEvent;
 use helix_view::keyboard::KeyCode;
+use parking_lot::Mutex;
 use std::sync::Arc;
 use std::{borrow::Cow, ops::RangeFrom};
 use tui::buffer::Buffer as Surface;
@@ -27,6 +28,24 @@ pub type Completion = (RangeFrom<usize>, Span<'static>);
 type CompletionFn = Box<dyn FnMut(&Editor, &str) -> Vec<Completion>>;
 type CallbackFn = Box<dyn FnMut(&mut Context, &str, PromptEvent)>;
 type ValidateCallbackFn = Box<dyn FnMut(&mut Context, &str) -> Option<crate::compositor::Callback>>;
+
+/// A host can move its input field as the layout changes without recreating the
+/// prompt or losing the input cursor. The prompt owns the active lifetime.
+#[derive(Default)]
+pub(crate) struct PromptAnchor {
+    pub area: Rect,
+    pub active: bool,
+}
+
+pub(crate) type SharedPromptAnchor = Arc<Mutex<PromptAnchor>>;
+
+struct AnchoredInput(SharedPromptAnchor);
+
+impl Drop for AnchoredInput {
+    fn drop(&mut self) {
+        self.0.lock().active = false;
+    }
+}
 pub type DocFn = Box<dyn Fn(&str) -> Option<Cow<str>>>;
 
 pub struct Prompt {
@@ -49,6 +68,7 @@ pub struct Prompt {
     pub doc_fn: DocFn,
     next_char_handler: Option<PromptCharHandler>,
     language: Option<(&'static str, Arc<ArcSwap<syntax::Loader>>)>,
+    placement: Option<AnchoredInput>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -106,6 +126,7 @@ impl Prompt {
             doc_fn: Box::new(|_| None),
             next_char_handler: None,
             language: None,
+            placement: None,
         }
     }
 
@@ -118,6 +139,41 @@ impl Prompt {
     pub fn with_line(mut self, line: String, editor: &Editor) -> Self {
         self.set_line(line, editor);
         self
+    }
+
+    pub(crate) fn with_anchor(mut self, anchor: SharedPromptAnchor) -> Self {
+        anchor.lock().active = true;
+        self.placement = Some(AnchoredInput(anchor));
+        self
+    }
+
+    fn input_area(&self, viewport: Rect) -> Rect {
+        self.placement.as_ref().map_or(viewport, |placement| {
+            placement.0.lock().area.intersection(viewport)
+        })
+    }
+
+    fn cursor_position(&self, viewport: Rect) -> Option<Position> {
+        let area = self.input_area(viewport);
+        if area.width < 3 || area.height == 0 {
+            return None;
+        }
+        let area = area
+            .clip_left(self.prompt.len() as u16)
+            .clip_right(if self.prompt.is_empty() { 2 } else { 0 });
+        let mut col = area.left() as usize + self.line[self.anchor..self.cursor].width();
+        if self.truncate_end
+            && self.line[self.anchor..self.cursor].width() >= self.line_area.width as usize
+        {
+            col = col.saturating_sub(1);
+        }
+        if self.truncate_start && self.cursor == self.anchor {
+            col += self.line[self.cursor..]
+                .graphemes(true)
+                .next()
+                .map_or(0, |g| g.width());
+        }
+        Some(Position::new(area.bottom().saturating_sub(1) as usize, col))
     }
 
     /// Return a compositor action to run after the prompt has closed.
@@ -414,12 +470,21 @@ const BASE_WIDTH: u16 = 30;
 
 impl Prompt {
     pub fn render_prompt(&mut self, area: Rect, surface: &mut Surface, cx: &mut Context) {
+        let area = self.input_area(area);
+        if area.width < 3 || area.height == 0 {
+            self.line_area = Rect::default();
+            return;
+        }
         let theme = &cx.editor.theme;
         let prompt_color = theme.get("ui.text");
         let completion_color = theme.get("ui.menu");
         let selected_color = theme.get("ui.menu.selected");
         let suggestion_color = theme.get("ui.text.inactive");
-        let background = theme.get("ui.background");
+        let background = theme.get(if self.placement.is_some() {
+            "ui.popup"
+        } else {
+            "ui.background"
+        });
         // completion
 
         let max_len = self
@@ -440,7 +505,7 @@ impl Prompt {
 
         let completion_area = Rect::new(
             area.x,
-            (area.height - height).saturating_sub(1),
+            area.bottom().saturating_sub(height + 1),
             area.width,
             height,
         );
@@ -671,6 +736,11 @@ impl Component for Prompt {
                 (self.callback_fn)(cx, &self.line, PromptEvent::Update);
             }
             ctrl!('s') => {
+                // A pane-local input must not implicitly read a background
+                // document's selection.
+                if self.placement.is_some() {
+                    return EventResult::Consumed(None);
+                }
                 let (view, doc) = current!(cx.editor);
                 let text = doc.text().slice(..);
 
@@ -791,31 +861,63 @@ impl Component for Prompt {
     }
 
     fn cursor(&self, area: Rect, editor: &Editor) -> (Option<Position>, CursorKind) {
-        let area = area
-            .clip_left(self.prompt.len() as u16)
-            .clip_right(if self.prompt.is_empty() { 2 } else { 0 });
-
-        let mut col = area.left() as usize + self.line[self.anchor..self.cursor].width();
-
-        // ensure the cursor does not go beyond elipses
-        if self.truncate_end
-            && self.line[self.anchor..self.cursor].width() >= self.line_area.width as usize
-        {
-            col -= 1;
+        match self.cursor_position(area) {
+            Some(position) => (
+                Some(position),
+                editor.config().cursor_shape.from_mode(Mode::Insert),
+            ),
+            None => (None, CursorKind::Hidden),
         }
+    }
+}
 
-        if self.truncate_start && self.cursor == self.anchor {
-            col += self.line[self.cursor..]
-                .graphemes(true)
-                .next()
-                .map_or(0, |g| g.width());
-        }
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-        let line = area.height as usize - 1;
+    fn prompt() -> Prompt {
+        Prompt::new("".into(), None, |_, _| Vec::new(), |_, _, _| {})
+    }
 
-        (
-            Some(Position::new(area.y as usize + line, col)),
-            editor.config().cursor_shape.from_mode(Mode::Insert),
-        )
+    #[test]
+    fn anchored_cursor_uses_the_message_field_and_tracks_layout_changes() {
+        let anchor = Arc::new(Mutex::new(PromptAnchor {
+            area: Rect::new(80, 14, 30, 1),
+            active: false,
+        }));
+        let mut prompt = prompt().with_anchor(anchor.clone());
+        prompt.line = "héllo".into();
+        prompt.cursor = prompt.line.len();
+        let viewport = Rect::new(0, 0, 120, 40);
+        assert_eq!(
+            prompt.cursor_position(viewport),
+            Some(Position::new(14, 85))
+        );
+        assert!(anchor.lock().active);
+        anchor.lock().area = Rect::new(60, 9, 25, 1);
+        assert_eq!(prompt.cursor_position(viewport), Some(Position::new(9, 65)));
+        drop(prompt);
+        assert!(!anchor.lock().active);
+    }
+
+    #[test]
+    fn hidden_or_tiny_inline_fields_hide_the_cursor() {
+        let anchor = Arc::new(Mutex::new(PromptAnchor::default()));
+        let prompt = prompt().with_anchor(anchor.clone());
+        let viewport = Rect::new(0, 0, 80, 24);
+        assert!(prompt.cursor_position(viewport).is_none());
+        anchor.lock().area = Rect::new(90, 5, 20, 1);
+        assert!(prompt.cursor_position(viewport).is_none());
+        anchor.lock().area = Rect::new(50, 5, 2, 1);
+        assert!(prompt.cursor_position(viewport).is_none());
+    }
+
+    #[test]
+    fn unanchored_prompts_still_use_the_bottom_row() {
+        let prompt = prompt();
+        assert_eq!(
+            prompt.cursor_position(Rect::new(0, 0, 120, 40)),
+            Some(Position::new(39, 0))
+        );
     }
 }
