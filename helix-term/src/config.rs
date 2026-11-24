@@ -162,6 +162,60 @@ mod tests {
     }
 
     #[test]
+    fn pane_layout_defaults_and_partial_overrides() {
+        use helix_view::editor::{PaneLayoutConfig, PanePosition};
+        assert_eq!(
+            Config::load_test("").editor.panes,
+            PaneLayoutConfig::default()
+        );
+        let config = Config::load_test(
+            r#"
+            [editor.panes]
+            opencode-position = "right"
+            file-explorer-size = 35
+        "#,
+        );
+        assert_eq!(
+            config.editor.panes,
+            PaneLayoutConfig {
+                opencode_position: PanePosition::Right,
+                file_explorer_size: 35,
+                ..PaneLayoutConfig::default()
+            }
+        );
+        for position in ["left", "right", "top", "bottom"] {
+            for size in [1, 40, 99] {
+                let config = format!(
+                    "[editor.panes]\nopencode-position = '{position}'\nopencode-size = {size}"
+                );
+                assert_eq!(Config::load_test(&config).editor.panes.opencode_size, size);
+            }
+        }
+    }
+
+    #[test]
+    fn pane_layout_rejects_invalid_sizes_positions_and_unknown_options() {
+        for option in [
+            "opencode-size = 0",
+            "opencode-size = 100",
+            "opencode-size = -1",
+            "file-explorer-size = 256",
+            "file-explorer-size = 0",
+            "file-explorer-size = 12.5",
+            "opencode-size = '40%'",
+            "opencode-position = 'center'",
+            "file-explorer-position = 'above'",
+            "unknown-size = 25",
+        ] {
+            let config = format!("[editor.panes]\n{option}");
+            assert!(
+                Config::load(Ok(&config), Err(ConfigLoadError::default())).is_err(),
+                "Accepted {option}"
+            );
+        }
+    }
+
+    #[test]
     fn parsing_keymaps_config_file() {
         use crate::keymap;
         use helix_core::hashmap;

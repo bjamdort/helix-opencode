@@ -6,12 +6,77 @@ subprocess. The chat pane uses the shared frontend pane host.
 
 ## Opening chat
 
-- Press `Space o` to toggle the right-hand chat pane open or closed.
+- Press `Space o` to toggle the chat pane open or closed (on the left by default).
 - Run `:opencode` to open or focus the pane without toggling it closed.
+- Run `:opencode-sessions` to browse and attach an existing session by title.
+- Closing chat with `Space o`, `q`, or `:quit` hides it. Reopening restores the
+  same session, draft, staged snippets, detail setting, and history position.
+  The connection stays active, so running work and approval requests continue
+  to update while the panel is hidden. Hiding is not an interruption.
 - Run `:opencode ses_...` to attach an existing session. The ID is validated before
   any request is made. An existing session keeps its server-side location.
 - Opening a fresh chat creates a session at the current document's workspace
   directory. It uses the service's default agent and model.
+
+Use `n` in the panel to start a new conversation or `:opencode-sessions` to switch.
+Retention lasts for the current Helix process; it does not restore chat after
+exiting and restarting Helix.
+
+## Appearance
+
+The panel recreates the OpenCode TUI session screen (`packages/tui`) inside the
+pane, using the active Helix theme:
+
+- There is no header. The transcript fills the pane and sticks to the bottom;
+  when you scroll away, a `Jump to latest ↓` row appears above the prompt.
+- User messages are shaded blocks with a `┃` rail in the agent color. Attached
+  files and selections appear as ` file ` chips; queued prompts use a muted rail
+  and a status line.
+- Assistant text is indented Markdown. Consecutive tool calls and thoughts,
+  including across steps, collapse into one summary such as
+  `+ 2 commands, 1 edit, 1 thought, 3 reads`. While work runs, the summary shows
+  a spinner and the current status, such as `Running command…`.
+- Press `t` to expand summaries into the TUI's tool rows: `→ Read`, `✱ Grep`,
+  `% WebFetch`, `◈ Web Search`, and subagent rows; shaded blocks for shell
+  commands (tail-collapsed output), edits and patches (numbered diffs), written
+  files, todos, and answered questions; and thoughts with their `**title**`.
+  Denied tools are struck through, and failures show their error.
+- A footer such as `Build · provider/model · 12.4s` ends each turn. Errors show
+  as `Error: …`, and interrupted steps are marked. Compactions are full-width
+  rules, and agent, model, and location switches are muted notices.
+- Pending approvals and questions appear in a dock above the prompt. Press `p`
+  to respond.
+- The prompt is a shaded card with an agent-colored rail and a half-height lower
+  edge. Below the input, it shows the agent, model, provider, and variant. The
+  footer shows the session directory when idle, or an activity scanner with
+  `c interrupt` while running, plus context tokens, cost, and key hints.
+
+Duration, token, and cost figures come from the server's step records. Model
+names show as `provider/model` because the pane does not load display names.
+Spinners animate only while the session is running.
+
+To customize the chat palette in a Helix theme, these optional scopes override
+the indicated defaults:
+
+| Scope | Default |
+| --- | --- |
+| `ui.opencode.accent` | `keyword` |
+| `ui.opencode.agent` | `ui.opencode.accent`; rails, agent names, and the scanner |
+| `ui.opencode.panel` | `ui.popup` background; user messages and tool blocks |
+| `ui.opencode.prompt` | `ui.popup` background; the prompt card |
+| `ui.opencode.border` | `ui.window`; queued and unfocused rails, thought rails |
+| `ui.opencode.muted` | `ui.text.inactive` |
+| `ui.opencode.thinking` | `warning`; thought titles |
+| `ui.opencode.info` | `info` |
+| `ui.opencode.heading` | `markup.heading` |
+| `ui.opencode.bold` | `markup.bold`, with `constant` as its color fallback |
+| `ui.opencode.code` | `markup.raw.inline` |
+| `ui.opencode.list` | `function` |
+| `ui.opencode.link` | `function`, underlined |
+| `ui.opencode.success` | `string` |
+| `ui.opencode.text` | `ui.text` |
+
+Diffs use `diff.plus`, `diff.minus`, and `diff.delta`.
 
 The service must already be running. Helix does not start, restart, replace, or
 stop it. Check its availability with `opencode service status` if connection fails.
@@ -57,7 +122,7 @@ that server; there is no local-to-remote path mapping yet.
 | `c`, `Ctrl-c` | Request interruption of the session's current execution. |
 | `n` | Start a new conversation. The previous session remains on the service. |
 | `r` | Reconnect and reload authoritative session/message/inbox state. |
-| `t` | Toggle reasoning and tool details. |
+| `t` | Expand or collapse activity summaries into thoughts and tool rows. |
 | `p` | Inspect pending permission requests and questions. |
 | `D` | Review the latest turn's recorded file changes. |
 | `J`, `K` | Jump to the next or previous message start. |
@@ -75,20 +140,40 @@ scrolling to the bottom or sending a message enables it again.
 
 ## Session behavior
 
-The pane follows the OpenCode TUI's layout: a session header, an independently
-scrolling conversation, and a persistent composer card with agent/model metadata.
-User messages have a shaded background and accent rail; assistant responses use
-Helix's Markdown renderer, including emphasis, lists, and syntax-highlighted code
-when a matching runtime grammar is available. Wrapping preserves inline styles.
+Assistant responses use Helix's Markdown renderer, including emphasis, lists, and
+syntax-highlighted code when a matching runtime grammar is available. Wrapping
+preserves inline styles.
 
-The composer previews your draft when idle. During composition, the shared Helix
-line editor and its cursor appear directly inside the message field, not on the
-global command line. `Enter` sends, and `Esc` cancels while retaining the draft.
-The input follows pane layout changes and resizing. Starting a new conversation
-clears the draft.
-Tool rows show status icons and input summaries. Press `t` to show reasoning and
-bounded tool input/output previews. Errors and approval notices remain visible
-in the transcript. Colors follow your Helix theme.
+The prompt previews your draft, up to three lines, when idle. During
+composition, the shared Helix line editor and its cursor appear directly inside
+the prompt, not on the global command line. `Enter` sends, and `Esc` cancels
+while retaining the draft. The input follows pane layout changes and resizing.
+Starting a new conversation clears the draft. Staged snippets appear as a chip
+row at the top of the prompt.
+
+## Selecting an existing session
+
+Run `:opencode-sessions` to open a searchable session picker. You do not need an
+open chat first. Type to filter by title, directory, or session ID. Non-archived
+top-level sessions from all workspaces appear newest first; the currently
+attached session is marked `current`.
+
+Press `Enter` to attach the selected session or `Esc` to cancel. Browsing does
+not create a session, send a prompt, change the working directory, or edit a
+document. Sessions load in pages of 100 as the picker remains open, up to 10,000
+sessions. Cancellation stops further pagination and never opens a delayed popup.
+
+Before switching, Helix checks that the selected session still exists and uses
+its current directory, even if the session moved after listing. If the current
+chat has an unsent draft or staged snippet context, type `yes` in the confirmation
+prompt to discard that local context and switch. `Esc` or any other answer keeps
+the current chat. Selecting the already attached session focuses it without
+discarding its draft. Switching does not interrupt work running in the old
+server session.
+
+You can still attach a known session directly with `:opencode ses_example`.
+Archived and subagent sessions are omitted from the picker but can be attached
+by ID.
 
 ## Sending editor selections with a message
 
@@ -195,9 +280,9 @@ is highlighted and disables auto-follow while you inspect the conversation.
 Manual scrolling clears reference selection, so `Enter` does not open a link
 that you have scrolled away from.
 
-Completed consecutive read tools collapse into a `Read N files` summary. Press
-`t` to expand their individual entries and previews; running or failed reads
-remain visible. The transcript does not append duplicate file-reference rows.
+Tool paths in expanded rows are links. Paths inside collapsed activity
+summaries are still listed by `f`. The transcript does not append duplicate
+file-reference rows.
 
 Press `f` for a pane-local list of all references, including collapsed tools and
 user messages. Use `j`/`k` to choose a file,
@@ -292,6 +377,12 @@ requests settled by another client are removed rather than replayed.
 
 ## Reviewing changes
 
+To review a turn's files as editable buffers with inline changes, use
+`:opencode-changes`. Use `:git-changes` or `:branch-changes` for local Git
+changes and `:changes-close` to return to the normal tree. Because the buffers
+are real, you can select changed lines and send them with `:opencode-selection`.
+See [Changes viewer](changes.md) for controls and limits.
+
 Press `D` to load the latest turn's structured diff from the service. Select a
 file with `j`/`k` and press `Enter` to inspect its patch. Use `j`/`k` or page
 movement to scroll; `r` refreshes the file list.
@@ -307,8 +398,8 @@ opened; traversal paths and symlinks escaping that directory are rejected.
 
 ## Current limits
 
-- One chat pane at a time; no session browser or tab bar. Existing sessions can be
-  selected by ID with `:opencode`.
+- One chat pane at a time, with no tab bar. Use `:opencode-sessions` to browse
+  existing sessions, or `:opencode` to attach by ID.
 - Up to the newest 200 messages are loaded. Older-history pagination is not yet
   exposed in the UI.
 - The composer uses a modal, single-line editor inside the pane, with horizontal
@@ -316,11 +407,16 @@ opened; traversal paths and symlinks escaping that directory are rejected.
 - Markdown uses Helix's existing renderer, not the complete OpenCode TUI renderer;
   file references have keyboard navigation, but web-link activation and rich
   tables are not yet supported.
-- Tool details are bounded previews, not fully scrollable output inspectors.
+- Tool details are bounded previews, not fully scrollable output inspectors:
+  shell output keeps its last lines, and diffs and written files show up to 40
+  lines. `t` expands every summary at once rather than one at a time.
+- Diffs are unified with colored text; the TUI's split view and diff
+  backgrounds are not reproduced. There is no sidebar.
 - No agent selector, image uploads, file-reference insertion into prompts, or persistent
   client-side session selection yet.
-- Review covers the latest turn, not arbitrary turn selection or full change
-  management. Existing buffers are not automatically refreshed.
+- Turn selection is available through `:opencode-changes` for loaded history;
+  staging, reverting, and other change-management mutations are not offered.
+  Existing buffers are not automatically refreshed.
 - Pane sizing follows the dock host; there is no interactive resizing.
 - This is a connection/chat foundation, not a complete replacement for the
   OpenCode desktop interface yet.
@@ -337,8 +433,14 @@ cargo test -p helix-term --lib live_service_connection_snapshot_forms_and_reconn
 # Session model and variant switching, including default reset; no inference.
 cargo test -p helix-term --lib live_service_model_and_variant_switching -- --ignored --nocapture
 
+# Session listing, selection revalidation, and attachment; no inference.
+cargo test -p helix-term --lib live_service_session_picker_listing_and_attach -- --ignored --nocapture
+
 # Exact buffer snapshot, source range, and desktop metadata; resume=false, no inference.
 cargo test -p helix-term --lib live_service_selected_snippet_admission -- --ignored --nocapture
+
+# Two explicitly approved fixture edits; earlier-turn patches must remain historical.
+HELIX_OPENCODE_TEST_MODEL='openai/gpt-6-luna#none' cargo test -p helix-term --lib live_service_historical_turn_changes -- --ignored --nocapture
 
 # Streamed chat, history reload, reconnect, follow-up, and active interruption.
 cargo test -p helix-term --lib live_service_chat_reconnect_and_followup -- --ignored --nocapture

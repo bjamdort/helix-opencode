@@ -174,8 +174,12 @@ impl<I, D> Clone for Injector<I, D> {
 pub struct InjectorShutdown;
 
 impl<T, D> Injector<T, D> {
+    pub fn is_shutdown(&self) -> bool {
+        self.version != self.picker_version.load(atomic::Ordering::Relaxed)
+    }
+
     pub fn push(&self, item: T) -> Result<(), InjectorShutdown> {
-        if self.version != self.picker_version.load(atomic::Ordering::Relaxed) {
+        if self.is_shutdown() {
             return Err(InjectorShutdown);
         }
 
@@ -271,6 +275,16 @@ pub struct Picker<T: 'static + Send + Sync, D: 'static> {
     dynamic_query_handler: Option<Sender<DynamicQueryChange>>,
 }
 
+fn matcher_redraw() -> Arc<dyn Fn() + Send + Sync> {
+    // Nucleo calls this from its own worker threads. Enter the originating
+    // editor's runtime so runtime-local redraw signals reach the right app.
+    let runtime = tokio::runtime::Handle::current();
+    Arc::new(move || {
+        let _guard = runtime.enter();
+        helix_event::request_redraw();
+    })
+}
+
 impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
     pub fn stream(
         columns: impl IntoIterator<Item = Column<T, D>>,
@@ -279,12 +293,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
         let columns: Arc<[_]> = columns.into_iter().collect();
         let matcher_columns = columns.iter().filter(|col| col.filter).count() as u32;
         assert!(matcher_columns > 0);
-        let matcher = Nucleo::new(
-            Config::DEFAULT,
-            Arc::new(helix_event::request_redraw),
-            None,
-            matcher_columns,
-        );
+        let matcher = Nucleo::new(Config::DEFAULT, matcher_redraw(), None, matcher_columns);
         let streamer = Injector {
             dst: matcher.injector(),
             columns,
@@ -314,12 +323,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             .filter(|col: &&Column<T, D>| col.filter)
             .count() as u32;
         assert!(matcher_columns > 0);
-        let matcher = Nucleo::new(
-            Config::DEFAULT,
-            Arc::new(helix_event::request_redraw),
-            None,
-            matcher_columns,
-        );
+        let matcher = Nucleo::new(Config::DEFAULT, matcher_redraw(), None, matcher_columns);
         let injector = matcher.injector();
         for item in options {
             inject_nucleo_item(&injector, &columns, item, &editor_data);

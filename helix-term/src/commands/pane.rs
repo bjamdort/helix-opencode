@@ -13,6 +13,8 @@ pub(crate) enum PaneCommand {
     PageUp,
     PageDown,
     Activate,
+    OpenHorizontalSplit,
+    OpenVerticalSplit,
     Refresh,
     Close,
     FocusDocument,
@@ -61,6 +63,8 @@ pub(crate) fn scope(command: &MappableCommand) -> CommandScope {
             Pane(PaneCommand::PageDown)
         }
         "pane_activate" => Pane(PaneCommand::Activate),
+        "pane_open_horizontal_split" => Pane(PaneCommand::OpenHorizontalSplit),
+        "pane_open_vertical_split" => Pane(PaneCommand::OpenVerticalSplit),
         "pane_compose" => Pane(PaneCommand::Compose),
         "pane_interrupt" => Pane(PaneCommand::Interrupt),
         "pane_new" => Pane(PaneCommand::New),
@@ -181,6 +185,11 @@ pub(crate) fn typed_is_workspace(name: &str) -> bool {
             | "run-shell-command"
             | "opencode"
             | "opencode-model"
+            | "opencode-sessions"
+            | "git-changes"
+            | "branch-changes"
+            | "opencode-changes"
+            | "changes-close"
             | "opencode-clear-context"
             | "opencode-comment"
     )

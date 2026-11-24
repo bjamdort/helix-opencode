@@ -2677,6 +2677,72 @@ fn run_shell_command(
     Ok(())
 }
 
+fn toggle_inline_diff(
+    cx: &mut compositor::Context,
+    _args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event == PromptEvent::Validate {
+        super::toggle_inline_diff_impl(cx.editor);
+    }
+    Ok(())
+}
+
+/// Choose what the current buffer is compared with: `head` or `branch`.
+/// Without an argument, report the current comparison.
+fn diff_base(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+    let doc = doc!(cx.editor);
+    let id = doc.id();
+    match args.first() {
+        None => {
+            let message = match (doc.diff_handle(), doc.diff_source()) {
+                (None, _) => "This buffer has no diff base".to_owned(),
+                (Some(_), source) => format!("Comparing with {}", source.unwrap_or("HEAD")),
+            };
+            cx.editor.set_status(message);
+        }
+        Some("head") => {
+            cx.editor.reset_diff_base(id);
+            cx.editor.set_status("Comparing with HEAD");
+        }
+        Some("branch") => {
+            let path = doc
+                .path()
+                .context("This buffer has no file to compare")?
+                .to_owned();
+            let trusted = cx
+                .editor
+                .workspace_trust
+                .query(
+                    doc.workspace_root(),
+                    helix_loader::workspace_trust::TrustQuery::Git,
+                )
+                .is_trusted();
+            anyhow::ensure!(trusted, "Trust this workspace before running Git");
+            let directory = path
+                .parent()
+                .context("This buffer has no file to compare")?
+                .to_owned();
+            let name = PathBuf::from(path.file_name().context("This buffer has no file name")?);
+            cx.jobs.callback(async move {
+                let point = ui::changes::branch_point(&directory).await?;
+                let base = ui::changes::file_at(&directory, &point.commit, &name).await?;
+                Ok(crate::job::Callback::Editor(Box::new(move |editor| {
+                    if let Some(doc) = editor.documents.get_mut(&id) {
+                        doc.set_custom_diff_base(base, point.label.clone());
+                        editor.set_status(format!("Comparing with {}", point.label));
+                    }
+                })))
+            });
+        }
+        Some(other) => bail!("Unknown diff base '{other}': expected head or branch"),
+    }
+    Ok(())
+}
+
 fn reset_diff_change(
     cx: &mut compositor::Context,
     _args: Args,
@@ -2996,6 +3062,46 @@ const WRITE_NO_CODE_ACTIONS_FLAG: Flag = Flag {
 };
 
 pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
+    TypableCommand {
+        name: "opencode-sessions",
+        aliases: &[],
+        doc: "Browse existing OpenCode sessions in a searchable picker and attach the selected chat.",
+        fun: |_, _, _| Ok(()),
+        completer: CommandCompleter::none(),
+        signature: Signature { positionals: (0, Some(0)), ..Signature::DEFAULT },
+    },
+    TypableCommand {
+        name: "git-changes",
+        aliases: &[],
+        doc: "Show files changed since HEAD in the explorer, opening each with its changes inline.",
+        fun: |_, _, _| Ok(()),
+        completer: CommandCompleter::none(),
+        signature: Signature { positionals: (0, Some(0)), ..Signature::DEFAULT },
+    },
+    TypableCommand {
+        name: "branch-changes",
+        aliases: &[],
+        doc: "Show files changed since the current branch split from the default branch, opening each with its changes inline.",
+        fun: |_, _, _| Ok(()),
+        completer: CommandCompleter::none(),
+        signature: Signature { positionals: (0, Some(0)), ..Signature::DEFAULT },
+    },
+    TypableCommand {
+        name: "opencode-changes",
+        aliases: &[],
+        doc: "Review an OpenCode turn's changes, optionally selecting a loaded user message ID.",
+        fun: |_, _, _| Ok(()),
+        completer: CommandCompleter::none(),
+        signature: Signature { positionals: (0, Some(1)), ..Signature::DEFAULT },
+    },
+    TypableCommand {
+        name: "changes-close",
+        aliases: &[],
+        doc: "Leave changes review and restore the normal file explorer.",
+        fun: |_, _, _| Ok(()),
+        completer: CommandCompleter::none(),
+        signature: Signature { positionals: (0, Some(0)), ..Signature::DEFAULT },
+    },
     TypableCommand {
         name: "opencode-selection",
         aliases: &[],
@@ -4017,6 +4123,28 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         signature: SHELL_SIGNATURE,
     },
     TypableCommand {
+        name: "toggle-inline-diff",
+        aliases: &["inline-diff"],
+        doc: "Show or hide changes against the diff base inside the buffer.",
+        fun: toggle_inline_diff,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "diff-base",
+        aliases: &[],
+        doc: "Compare the buffer with `head` or with `branch`, where the current branch split from the default branch. Without an argument, show the current comparison.",
+        fun: diff_base,
+        completer: CommandCompleter::all(completers::diff_base),
+        signature: Signature {
+            positionals: (0, Some(1)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
         name: "reset-diff-change",
         aliases: &["diffget", "diffg"],
         doc: "Reset the diff change at the cursor position.",
@@ -4222,6 +4350,24 @@ pub(super) fn execute_command(
             return Ok(Some(super::pane::close_callback(target)));
         }
         return Ok(None);
+    }
+    if cmd.name == "opencode-sessions" {
+        return Ok((event == PromptEvent::Validate).then(ui::opencode_sessions_callback));
+    }
+    if cmd.name == "git-changes" {
+        return Ok((event == PromptEvent::Validate).then(|| ui::changes::git_callback(cx.editor)));
+    }
+    if cmd.name == "branch-changes" {
+        return Ok(
+            (event == PromptEvent::Validate).then(|| ui::changes::branch_callback(cx.editor))
+        );
+    }
+    if cmd.name == "opencode-changes" {
+        return Ok((event == PromptEvent::Validate)
+            .then(|| ui::changes::opencode_callback(args.first().map(str::to_owned))));
+    }
+    if cmd.name == "changes-close" {
+        return Ok((event == PromptEvent::Validate).then(ui::changes::close_callback));
     }
     if cmd.name == "opencode-selection" {
         return if event == PromptEvent::Validate {

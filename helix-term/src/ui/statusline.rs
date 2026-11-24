@@ -537,11 +537,14 @@ fn render_version_control<'a, F>(context: &mut RenderContext<'a>, write: F)
 where
     F: Fn(&mut RenderContext<'a>, Span<'a>) + Copy,
 {
-    let head = context
+    let mut head = context
         .doc
         .version_control_head()
         .unwrap_or_default()
         .to_string();
+    if let Some(source) = context.doc.diff_source() {
+        head.push_str(&format!(" vs {source}"));
+    }
 
     write(context, head.into());
 }

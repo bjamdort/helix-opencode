@@ -101,6 +101,26 @@
 | `file_picker_in_current_buffer_directory` | Open file picker at current buffer's directory |  |
 | `file_picker_in_current_directory` | Open file picker at current working directory | normal: `` <space>F ``, select: `` <space>F `` |
 | `file_explorer` | Open file explorer in workspace root | normal: `` <space>e ``, select: `` <space>e `` |
+| `toggle_file_explorer` | Toggle the file explorer sidebar | normal: `` <space>E ``, select: `` <space>E `` |
+| `opencode_chat` | Toggle the OpenCode chat pane | normal: `` <space>o ``, select: `` <space>o `` |
+| `pane_activate` | Activate the selected pane item |  |
+| `pane_open_horizontal_split` | Open the selected pane file in a split below |  |
+| `pane_open_vertical_split` | Open the selected pane file in a split to the right |  |
+| `pane_compose` | Compose a message in the focused pane |  |
+| `pane_interrupt` | Interrupt the focused pane's operation |  |
+| `pane_new` | Start a new conversation in the focused pane |  |
+| `pane_toggle_details` | Toggle details in the focused pane |  |
+| `pane_requests` | Inspect pending pane requests |  |
+| `pane_review` | Review the chat session's latest changes |  |
+| `pane_next_reference` | Select the next file reference in the pane |  |
+| `pane_previous_reference` | Select the previous file reference in the pane |  |
+| `pane_open_reference` | Open the selected file reference |  |
+| `pane_references` | List file references in the pane |  |
+| `pane_next_message` | Jump to the next chat message |  |
+| `pane_previous_message` | Jump to the previous chat message |  |
+| `pane_refresh` | Refresh the focused pane |  |
+| `pane_close` | Close the focused pane |  |
+| `focus_document_pane` | Focus the last document pane |  |
 | `file_explorer_in_current_buffer_directory` | Open file explorer at current buffer's directory | normal: `` <space>. ``, select: `` <space>. `` |
 | `file_explorer_in_current_directory` | Open file explorer at current working directory |  |
 | `code_action` | Perform code action | normal: `` <space>a ``, select: `` <space>a `` |
@@ -215,6 +235,7 @@
 | `completion` | Invoke completion popup | insert: `` <C-x> `` |
 | `hover` | Show docs for item under cursor | normal: `` <space>k ``, select: `` <space>k `` |
 | `toggle_comments` | Comment/uncomment selections | normal: `` <C-c> ``, `` <space>c ``, select: `` <C-c> ``, `` <space>c `` |
+| `toggle_inline_diff` | Show or hide changes against the diff base inside the buffer |  |
 | `toggle_line_comments` | Line comment/uncomment selections | normal: `` <space><A-c> ``, select: `` <space><A-c> `` |
 | `toggle_block_comments` | Block comment/uncomment selections | normal: `` <space>C ``, select: `` <space>C `` |
 | `rotate_selections_forward` | Rotate selections forward | normal: `` ) ``, select: `` ) `` |

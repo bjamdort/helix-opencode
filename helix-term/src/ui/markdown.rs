@@ -141,6 +141,15 @@ pub struct Markdown {
     contents: String,
 
     config_loader: Arc<ArcSwap<syntax::Loader>>,
+    chat: bool,
+}
+
+/// Chat-specific overrides fall back to syntax colors from the active theme.
+/// In particular, ui.text.info is not defined by many editor themes.
+pub(super) fn chat_style(theme: &Theme, role: &str, fallback: &str) -> Style {
+    theme
+        .try_get_exact(&format!("ui.opencode.{role}"))
+        .unwrap_or_else(|| theme.get(fallback))
 }
 
 /// A rendered prose/code span, with its enclosing link destination when present.
@@ -175,7 +184,13 @@ impl Markdown {
         Self {
             contents,
             config_loader,
+            chat: false,
         }
+    }
+
+    pub(super) fn for_chat(mut self) -> Self {
+        self.chat = true;
+        self
     }
 
     pub fn parse(&self, theme: Option<&Theme>) -> tui::text::Text<'_> {
@@ -212,7 +227,39 @@ impl Markdown {
             }
         };
 
-        let get_theme = |key: &str| -> Style { theme.map(|t| t.get(key)).unwrap_or_default() };
+        let get_theme = |key: &str| -> Style {
+            let Some(theme) = theme else {
+                return Style::default();
+            };
+            if !self.chat {
+                return theme.get(key);
+            }
+            match key {
+                Self::TEXT_STYLE => chat_style(theme, "text", key),
+                Self::BLOCK_STYLE => chat_style(theme, "code", key),
+                Self::UNNUMBERED_LIST_STYLE | Self::NUMBERED_LIST_STYLE => {
+                    chat_style(theme, "list", "function")
+                }
+                key if key.starts_with("markup.heading") => {
+                    chat_style(theme, "heading", key).add_modifier(Modifier::BOLD)
+                }
+                "markup.bold" => {
+                    let fallback = theme.get(key);
+                    let color = if fallback.fg.is_some() {
+                        fallback
+                    } else {
+                        theme.get("constant").patch(fallback)
+                    };
+                    theme
+                        .try_get_exact("ui.opencode.bold")
+                        .unwrap_or(color)
+                        .add_modifier(Modifier::BOLD)
+                }
+                "markup.link.text" => chat_style(theme, "link", "function")
+                    .underline_style(helix_view::graphics::UnderlineStyle::Line),
+                _ => theme.get(key),
+            }
+        };
         let text_style = get_theme(Self::TEXT_STYLE);
         let code_style = get_theme(Self::BLOCK_STYLE);
         let numbered_list_style = get_theme(Self::NUMBERED_LIST_STYLE);
@@ -340,21 +387,43 @@ impl Markdown {
                         );
                         lines.extend(tui_text.lines);
                     } else {
-                        let style = match tags.last() {
-                            Some(Tag::Heading { level, .. }) => match level {
-                                HeadingLevel::H1 => heading_styles[0],
-                                HeadingLevel::H2 => heading_styles[1],
-                                HeadingLevel::H3 => heading_styles[2],
-                                HeadingLevel::H4 => heading_styles[3],
-                                HeadingLevel::H5 => heading_styles[4],
-                                HeadingLevel::H6 => heading_styles[5],
-                            },
-                            Some(Tag::Emphasis) => text_style.add_modifier(Modifier::ITALIC),
-                            Some(Tag::Strong) => text_style.add_modifier(Modifier::BOLD),
-                            Some(Tag::Strikethrough) => {
-                                text_style.add_modifier(Modifier::CROSSED_OUT)
+                        let style = if self.chat {
+                            tags.iter().fold(text_style, |style, tag| match tag {
+                                Tag::Heading { level, .. } => style.patch(
+                                    heading_styles[match level {
+                                        HeadingLevel::H1 => 0,
+                                        HeadingLevel::H2 => 1,
+                                        HeadingLevel::H3 => 2,
+                                        HeadingLevel::H4 => 3,
+                                        HeadingLevel::H5 => 4,
+                                        HeadingLevel::H6 => 5,
+                                    }],
+                                ),
+                                Tag::Emphasis => style
+                                    .patch(get_theme("markup.italic"))
+                                    .add_modifier(Modifier::ITALIC),
+                                Tag::Strong => style.patch(get_theme("markup.bold")),
+                                Tag::Strikethrough => style.add_modifier(Modifier::CROSSED_OUT),
+                                Tag::Link { .. } => style.patch(get_theme("markup.link.text")),
+                                _ => style,
+                            })
+                        } else {
+                            match tags.last() {
+                                Some(Tag::Heading { level, .. }) => match level {
+                                    HeadingLevel::H1 => heading_styles[0],
+                                    HeadingLevel::H2 => heading_styles[1],
+                                    HeadingLevel::H3 => heading_styles[2],
+                                    HeadingLevel::H4 => heading_styles[3],
+                                    HeadingLevel::H5 => heading_styles[4],
+                                    HeadingLevel::H6 => heading_styles[5],
+                                },
+                                Some(Tag::Emphasis) => text_style.add_modifier(Modifier::ITALIC),
+                                Some(Tag::Strong) => text_style.add_modifier(Modifier::BOLD),
+                                Some(Tag::Strikethrough) => {
+                                    text_style.add_modifier(Modifier::CROSSED_OUT)
+                                }
+                                _ => text_style,
                             }
-                            _ => text_style,
                         };
                         spans.push(Span::styled(text, style));
                     }
@@ -362,6 +431,7 @@ impl Markdown {
                 Event::Code(text) | Event::Html(text) => {
                     spans.push(Span::styled(text, code_style));
                 }
+                Event::SoftBreak if self.chat => spans.push(Span::styled(" ", text_style)),
                 Event::SoftBreak | Event::HardBreak => {
                     push_line(&mut spans, &mut lines);
                     if !list_stack.is_empty() {

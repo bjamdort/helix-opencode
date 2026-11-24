@@ -1,3 +1,4 @@
+pub(crate) mod changes;
 mod completion;
 mod document;
 pub(crate) mod editor;
@@ -8,6 +9,7 @@ mod markdown;
 pub mod menu;
 mod opencode;
 pub(crate) use opencode::models::callback as opencode_model_callback;
+pub(crate) use opencode::sessions::callback as opencode_sessions_callback;
 pub(crate) use opencode::snippets::{
     clear_callback as opencode_clear_context_callback,
     comment_callback as opencode_comment_callback,
@@ -470,6 +472,13 @@ pub mod completers {
         fuzzy_match(input, names, true)
             .into_iter()
             .map(|(name, _)| ((0..), name.into()))
+            .collect()
+    }
+
+    pub fn diff_base(_editor: &Editor, input: &str) -> Vec<Completion> {
+        fuzzy_match(input, ["head", "branch"], false)
+            .into_iter()
+            .map(|(name, _)| ((0..), (*name).into()))
             .collect()
     }
 

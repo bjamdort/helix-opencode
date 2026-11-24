@@ -1,5 +1,15 @@
 | Name | Description |
 | --- | --- |
+| `:opencode-sessions` | Browse existing OpenCode sessions in a searchable picker and attach the selected chat. |
+| `:git-changes` | Show files changed since HEAD in the explorer, opening each with its changes inline. |
+| `:branch-changes` | Show files changed since the current branch split from the default branch, opening each with its changes inline. |
+| `:opencode-changes` | Review an OpenCode turn's changes, optionally selecting a loaded user message ID. |
+| `:changes-close` | Leave changes review and restore the normal file explorer. |
+| `:opencode-selection` | Comment on editor selections in the bottom input row, then attach them to OpenCode without saving. |
+| `:opencode-comment` | Select a staged OpenCode snippet and edit its reference comment without sending. |
+| `:opencode-clear-context` | Remove staged OpenCode snippets without clearing the message draft. |
+| `:opencode-model` | Select the current OpenCode session's model and variant. |
+| `:opencode` | Open OpenCode chat, optionally attaching an existing session ID. |
 | `:exit`, `:x`, `:xit` | Write changes to disk if the buffer is modified and then quit. Accepts an optional path (:exit some/path.txt). |
 | `:exit!`, `:x!`, `:xit!` | Force write changes to disk, creating necessary subdirectories, if the buffer is modified and then quit. Accepts an optional path (:exit! some/path.txt). |
 | `:quit`, `:q` | Close the current view. |
@@ -87,6 +97,8 @@
 | `:pipe`, `:\|` | Pipe each selection to the shell command. |
 | `:pipe-to` | Pipe each selection to the shell command, ignoring output. |
 | `:run-shell-command`, `:sh`, `:!` | Run a shell command |
+| `:toggle-inline-diff`, `:inline-diff` | Show or hide changes against the diff base inside the buffer. |
+| `:diff-base` | Compare the buffer with `head` or with `branch`, where the current branch split from the default branch. Without an argument, show the current comparison. |
 | `:reset-diff-change`, `:diffget`, `:diffg` | Reset the diff change at the cursor position. |
 | `:clear-register` | Clear given register. If no argument is provided, clear all registers. |
 | `:set-register` | Set contents of the given register. |

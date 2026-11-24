@@ -46,6 +46,7 @@ pub struct EditorView {
     spinners: ProgressSpinners,
     /// Tracks if the terminal window is focused by reaction to terminal focus events
     terminal_focused: bool,
+    inline_diff_highlights: std::cell::RefCell<text_decorations::diff::HighlightCache>,
 }
 
 #[derive(Debug, Clone)]
@@ -70,6 +71,7 @@ impl EditorView {
             last_insert: (commands::MappableCommand::normal_mode, Vec::new()),
             completion: None,
             spinners: ProgressSpinners::default(),
+            inline_diff_highlights: Default::default(),
             terminal_focused: true,
         }
     }
@@ -86,11 +88,17 @@ impl EditorView {
     }
 
     pub fn open_file_tree(&mut self, root: PathBuf, editor: &mut Editor) -> std::io::Result<()> {
+        if let Some(id) = self.panes.find(super::changes::ID) {
+            self.panes.remove(id, editor);
+        }
         if let Some(id) = self.panes.find(super::file_tree::ID) {
             let tree = self
                 .panes
                 .get_mut::<super::file_tree::FileTree>(id)
                 .unwrap();
+            if let Some(review) = tree.changes.take() {
+                super::changes::restore(editor, &review);
+            }
             if tree.root != root {
                 *tree = super::file_tree::FileTree::new(root)?;
             }
@@ -98,8 +106,7 @@ impl EditorView {
         } else {
             self.panes.insert(
                 super::file_tree::FileTree::new(root)?,
-                super::pane::Dock::Left,
-                32,
+                super::pane::Dock::Workspace,
                 editor,
             );
         }
@@ -108,6 +115,17 @@ impl EditorView {
 
     pub fn toggle_file_tree(&mut self, root: PathBuf, editor: &mut Editor) -> std::io::Result<()> {
         if let Some(id) = self.panes.find(super::file_tree::ID) {
+            // Closing the explorer during review ends the review.
+            if let Some(review) = self
+                .panes
+                .get_mut::<super::file_tree::FileTree>(id)
+                .and_then(|tree| tree.changes.take())
+            {
+                super::changes::restore(editor, &review);
+                if let Some(diff) = self.panes.find(super::changes::ID) {
+                    self.panes.remove(diff, editor);
+                }
+            }
             self.panes.remove(id, editor);
             Ok(())
         } else {
@@ -120,7 +138,11 @@ impl EditorView {
         directory: PathBuf,
         editor: &mut Editor,
     ) -> anyhow::Result<()> {
-        if let Some(id) = self.panes.find(super::opencode::ID) {
+        if let Some(id) = self
+            .panes
+            .find(super::opencode::ID)
+            .filter(|id| self.panes.is_visible(*id))
+        {
             self.panes.remove(id, editor);
             Ok(())
         } else {
@@ -145,8 +167,7 @@ impl EditorView {
         } else {
             self.panes.insert(
                 super::opencode::OpenCode::new(directory, session)?,
-                super::pane::Dock::Right,
-                64,
+                super::pane::Dock::Outer,
                 editor,
             );
         }
@@ -185,6 +206,22 @@ impl EditorView {
 
         let text_annotations = view.text_annotations(doc, Some(theme));
         let mut decorations = DecorationManager::default();
+
+        // Before the cursorline, which stays visible on changed lines, and
+        // before inline diagnostics, matching the order of their line annotations.
+        if let Some(diff) = helix_view::annotations::diff::InlineDiff::for_document(doc) {
+            decorations.add_decoration(text_decorations::diff::InlineDiffDecoration::new(
+                doc.text().slice(..),
+                diff,
+                view.area.clip_bottom(1),
+                doc.tab_width(),
+                doc.language_config()
+                    .map(|config| config.language_id.clone()),
+                theme,
+                &loader,
+                &self.inline_diff_highlights,
+            ));
+        }
 
         if is_focused && config.cursorline {
             decorations.add_decoration(Self::cursorline(doc, view, theme));
@@ -751,8 +788,11 @@ impl EditorView {
         Some(OverlayHighlights::Homogeneous { highlight, ranges })
     }
 
-    /// Render bufferline at the top
+    /// Render the bufferline inside the document region.
     pub fn render_bufferline(editor: &Editor, viewport: Rect, surface: &mut Surface) {
+        if viewport.width == 0 || viewport.height == 0 {
+            return;
+        }
         let scratch = PathBuf::from(SCRATCH_BUFFER_NAME); // default filename to use for scratch buffer
         surface.clear_with(
             viewport,
@@ -791,14 +831,13 @@ impl EditorView {
             };
 
             let text = format!(" {}{} ", fname, if doc.is_modified() { "[+]" } else { "" });
-            let used_width = viewport.x.saturating_sub(x);
-            let rem_width = surface.area.width.saturating_sub(used_width);
+            let rem_width = viewport.right().saturating_sub(x);
 
             x = surface
                 .set_stringn(x, viewport.y, &text, rem_width as usize, style)
                 .0;
 
-            if x >= surface.area.right() {
+            if x >= viewport.right() {
                 break;
             }
         }
@@ -1732,24 +1771,30 @@ impl Component for EditorView {
             _ => false,
         };
 
-        // -1 for commandline and -1 for bufferline
+        // Tool panes use the full height above the global command line.
         let mut editor_area = area.clip_bottom(1);
-        if use_bufferline {
-            editor_area = editor_area.clip_top(1);
-        }
-
-        editor_area = self.panes.layout(editor_area, &mut cx.editor.focused_pane);
+        editor_area = self
+            .panes
+            .layout(editor_area, &mut cx.editor.focused_pane, &config.panes);
+        // A review pane replaces the whole document region, including the
+        // bufferline, so no document chrome or text is drawn behind it.
+        self.panes
+            .layout_center(editor_area, &mut cx.editor.focused_pane);
+        let bufferline =
+            editor_area.with_height(u16::from(use_bufferline && editor_area.height > 0));
+        editor_area = editor_area.clip_top(bufferline.height);
         self.sync_pane_focus(cx.editor);
+        let covered = self.panes.covers_documents(cx.editor);
         self.panes.render(surface, cx.editor, cx.jobs);
 
         // if the terminal size suddenly changed, we need to trigger a resize
         cx.editor.resize(editor_area);
 
-        if use_bufferline {
-            Self::render_bufferline(cx.editor, area.with_height(1), surface);
+        if bufferline.height > 0 && !covered {
+            Self::render_bufferline(cx.editor, bufferline, surface);
         }
 
-        for (view, is_focused) in cx.editor.tree.views() {
+        for (view, is_focused) in cx.editor.tree.views().filter(|_| !covered) {
             let doc = cx.editor.document(view.doc).unwrap();
             let document_focused = cx.editor.focused_pane.is_none();
             self.render_view(

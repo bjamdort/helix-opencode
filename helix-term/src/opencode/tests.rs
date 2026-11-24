@@ -27,6 +27,51 @@ fn sse_handles_chunked_utf8_comments_and_multiline_crlf() -> Result<()> {
 }
 
 #[test]
+fn step_boundaries_and_tool_progress_update_the_transcript() -> Result<()> {
+    let mut state = State::default();
+    state.apply(event("session.step.started", json!({"assistantMessageID":"msg_a", "agent":"build", "model":{"providerID":"test","id":"chat"}, "started": 1000})))?;
+    state.apply(event("session.tool.called", json!({"assistantMessageID":"msg_a", "id":"call_1", "name":"bash", "input":{"command":"ls"}, "executed":true})))?;
+    state.apply(event(
+        "session.tool.progress",
+        json!({"assistantMessageID":"msg_a", "id":"call_1", "metadata":{"output":"a"}}),
+    ))?;
+    let tool = state.messages[0].content[0].state.as_ref().unwrap();
+    assert_eq!(tool.status, "running");
+    assert_eq!(tool.metadata.as_ref().unwrap()["output"], "a");
+    state.apply(event("session.tool.success", json!({"assistantMessageID":"msg_a", "id":"call_1", "content":[{"type":"text","text":"a"}], "metadata":{"exit":0}, "executed":true})))?;
+    assert_eq!(
+        state.messages[0].content[0]
+            .state
+            .as_ref()
+            .unwrap()
+            .metadata
+            .as_ref()
+            .unwrap()["exit"],
+        0
+    );
+    let message = &state.messages[0];
+    assert_eq!(message.time.created, Some(1000));
+    assert!(message.finish.is_none());
+    state.apply(event(
+        "session.step.ended",
+        json!({"assistantMessageID":"msg_a", "finish":"stop", "cost":0.5,
+        "tokens":{"input":10,"output":5,"reasoning":0,"cache":{"read":1,"write":0}}}),
+    ))?;
+    let message = &state.messages[0];
+    assert_eq!(message.finish.as_deref(), Some("stop"));
+    assert_eq!(message.cost, Some(0.5));
+    assert_eq!(message.tokens.unwrap().total(), 16.0);
+    assert!(message.time.completed.is_some());
+    state.apply(event(
+        "session.step.failed",
+        json!({"assistantMessageID":"msg_b", "error":{"type":"unknown","message":"boom"}}),
+    ))?;
+    assert_eq!(state.messages[1].finish.as_deref(), Some("error"));
+    assert_eq!(error_summary(state.messages[1].error.as_ref()), "boom");
+    Ok(())
+}
+
+#[test]
 fn text_streams_are_per_kind_and_completed_values_are_authoritative() -> Result<()> {
     let mut state = State::default();
     state.apply(event("session.step.started", json!({"assistantMessageID":"msg_a", "agent":"build", "model":{"providerID":"test","id":"chat"}})))?;
@@ -146,6 +191,7 @@ struct Mock {
     forms: Arc<Mutex<Vec<Value>>>,
     reply_status: Arc<Mutex<Option<u16>>>,
     changes: Arc<Mutex<Vec<Value>>>,
+    session_pages: Arc<Mutex<std::collections::VecDeque<Value>>>,
     task: JoinHandle<()>,
 }
 
@@ -165,6 +211,7 @@ impl Mock {
         let forms = Arc::new(Mutex::new(Vec::<Value>::new()));
         let reply_status = Arc::new(Mutex::new(None::<u16>));
         let changes = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let session_pages = Arc::new(Mutex::new(std::collections::VecDeque::<Value>::new()));
         let (events, rx) = mpsc::channel::<String>(32);
         let receiver = Arc::new(Mutex::new(Some(rx)));
         let content = messages.clone();
@@ -173,6 +220,7 @@ impl Mock {
         let pending_forms = forms.clone();
         let status = reply_status.clone();
         let diffs = changes.clone();
+        let pages = session_pages.clone();
         let selected_model = Arc::new(Mutex::new(json!({"providerID":"test","id":"chat"})));
         let task = tokio::spawn(async move {
             while let Ok((mut socket, _)) = listener.accept().await {
@@ -183,6 +231,7 @@ impl Mock {
                 let pending_forms = pending_forms.clone();
                 let status = status.clone();
                 let diffs = diffs.clone();
+                let pages = pages.clone();
                 let selected_model = selected_model.clone();
                 tokio::spawn(async move {
                     let mut input = Vec::new();
@@ -278,6 +327,20 @@ impl Mock {
                         socket.write_all(format!("HTTP/1.1 {code} Test\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
                         return;
                     }
+                    if path.starts_with("/api/session?") {
+                        let code = status.lock().take().unwrap_or(200);
+                        let page = pages
+                            .lock()
+                            .pop_front()
+                            .unwrap_or_else(|| json!({"data":[],"cursor":{}}));
+                        let body = page.to_string();
+                        socket.write_all(format!("HTTP/1.1 {code} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+                        return;
+                    }
+                    if path == "/api/session/ses_missing" {
+                        socket.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}").await.unwrap();
+                        return;
+                    }
                     let session = json!({"id":"ses_test","location":{"directory":"/work space"},"time":{},"agent":"build","model":*selected_model.lock()});
                     let response = if path == "/api/info" {
                         json!({"pid":42,"version":"2.1.0"})
@@ -325,6 +388,7 @@ impl Mock {
             forms,
             reply_status,
             changes,
+            session_pages,
         }
     }
 
@@ -334,6 +398,150 @@ impl Mock {
             .await
             .unwrap();
     }
+}
+
+fn session_row(id: &str, title: &str) -> Value {
+    json!({"id":id,"title":title,"location":{"directory":"/work space"},"time":{}})
+}
+
+#[tokio::test]
+async fn session_picker_lists_authenticated_pages_without_creating_sessions() -> Result<()> {
+    use sessions::SessionBrowser;
+    let mock = Mock::new(true).await;
+    let cursor = "cursor/+?= &";
+    mock.session_pages.lock().extend([
+        json!({"data":[session_row("ses_first","First")],"cursor":{"next":cursor}}),
+        json!({"data":[session_row("ses_first","Duplicate"),session_row("ses_second","Second")],"cursor":{}}),
+    ]);
+    let api = Api::connect(Endpoint::new(&mock.url, Some("test".into()), None)?).await?;
+    let browser = SessionBrowser::new(api);
+    let mut listed = Vec::new();
+    assert_eq!(
+        browser
+            .stream(
+                |session| {
+                    listed.push(session.id);
+                    true
+                },
+                || false
+            )
+            .await?,
+        2
+    );
+    assert_eq!(listed, ["ses_first", "ses_second"]);
+    let requests = mock.requests.lock();
+    let pages: Vec<_> = requests
+        .iter()
+        .filter(|(request, _)| request.starts_with("GET /api/session?"))
+        .collect();
+    assert_eq!(pages.len(), 2);
+    let query = |request: &str| -> std::collections::HashMap<String, String> {
+        reqwest::Url::parse(&format!(
+            "http://test{}",
+            request.split_whitespace().nth(1).unwrap()
+        ))
+        .unwrap()
+        .query_pairs()
+        .into_owned()
+        .collect()
+    };
+    let first = query(&pages[0].0);
+    assert_eq!(first.get("limit").map(String::as_str), Some("100"));
+    assert_eq!(first.get("parentID").map(String::as_str), Some("null"));
+    assert_eq!(first.get("archived").map(String::as_str), Some("false"));
+    assert_eq!(first.get("order").map(String::as_str), Some("desc"));
+    assert_eq!(
+        query(&pages[1].0).get("cursor").map(String::as_str),
+        Some(cursor)
+    );
+    assert!(requests
+        .iter()
+        .all(|(request, _)| request.starts_with("GET ")));
+    Ok(())
+}
+
+#[tokio::test]
+async fn cancelled_session_picker_does_not_fetch_another_page() -> Result<()> {
+    let mock = Mock::new(false).await;
+    mock.session_pages
+        .lock()
+        .push_back(json!({"data":[session_row("ses_first","First")],"cursor":{"next":"next"}}));
+    let browser =
+        sessions::SessionBrowser::new(Api::connect(Endpoint::new(&mock.url, None, None)?).await?);
+    let cancelled = std::cell::Cell::new(false);
+    browser
+        .stream(
+            |_| {
+                cancelled.set(true);
+                false
+            },
+            || cancelled.get(),
+        )
+        .await?;
+    assert_eq!(
+        mock.requests
+            .lock()
+            .iter()
+            .filter(|(request, _)| request.starts_with("GET /api/session?"))
+            .count(),
+        1
+    );
+    let before = mock.requests.lock().len();
+    browser
+        .stream(
+            |_| panic!("Closed picker must not receive sessions"),
+            || true,
+        )
+        .await?;
+    assert_eq!(mock.requests.lock().len(), before);
+    Ok(())
+}
+
+#[tokio::test]
+async fn session_list_errors_and_repeated_cursors_are_reported_without_mutations() -> Result<()> {
+    let mock = Mock::new(false).await;
+    mock.session_pages.lock().extend([
+        json!({"data":[],"cursor":{"next":"repeat"}}),
+        json!({"data":[],"cursor":{"next":"repeat"}}),
+    ]);
+    let browser =
+        sessions::SessionBrowser::new(Api::connect(Endpoint::new(&mock.url, None, None)?).await?);
+    assert!(browser
+        .stream(|_| true, || false)
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("repeated"));
+    *mock.reply_status.lock() = Some(401);
+    assert!(browser.stream(|_| true, || false).await.is_err());
+    assert!(mock
+        .requests
+        .lock()
+        .iter()
+        .all(|(request, _)| request.starts_with("GET ")));
+    Ok(())
+}
+
+#[tokio::test]
+async fn session_picker_revalidates_selected_sessions_and_rejects_bad_ids() -> Result<()> {
+    let mock = Mock::new(false).await;
+    let browser =
+        sessions::SessionBrowser::new(Api::connect(Endpoint::new(&mock.url, None, None)?).await?);
+    let selected = browser.session("ses_test").await?;
+    assert_eq!(
+        selected.location.directory,
+        std::path::Path::new("/work space")
+    );
+    assert!(browser.session("ses_missing").await.is_err());
+    let before = mock.requests.lock().len();
+    assert!(browser.session("ses_bad/../path").await.is_err());
+    assert_eq!(mock.requests.lock().len(), before);
+    assert!(mock
+        .requests
+        .lock()
+        .iter()
+        .all(|(request, _)| request.starts_with("GET ")));
+    Ok(())
 }
 
 async fn wait(shared: &Mutex<State>, ready: impl Fn(&State) -> bool) {
@@ -377,6 +585,35 @@ async fn mock_connection(mock: &Mock) -> Result<Connection> {
         requests,
         task,
     })
+}
+
+#[tokio::test]
+async fn turn_review_requests_exact_user_anchors_without_mutating_the_session() -> Result<()> {
+    let mock = Mock::new(false).await;
+    let connection = mock_connection(&mock).await?;
+    let handle = connection.changes_handle()?;
+    *mock.changes.lock() = vec![
+        json!({"file":"first.rs","patch":"+first\n","status":"added","additions":1,"deletions":0}),
+    ];
+    let first = handle.diff("msg_first".into())?.await??;
+    *mock.changes.lock() = vec![
+        json!({"file":"second.rs","patch":"-old\n+second\n","status":"modified","additions":1,"deletions":1}),
+    ];
+    let second = handle.diff("msg_second".into())?.await??;
+    assert_eq!(first[0].file, "first.rs");
+    assert_eq!(second[0].file, "second.rs");
+    assert!(handle.diff("msg_bad/../path".into()).is_err());
+    let requests = mock.requests.lock();
+    assert!(requests
+        .iter()
+        .any(|(request, _)| request == "GET /api/session/ses_test/diff?from=msg_first HTTP/1.1"));
+    assert!(requests
+        .iter()
+        .any(|(request, _)| request == "GET /api/session/ses_test/diff?from=msg_second HTTP/1.1"));
+    assert!(requests
+        .iter()
+        .all(|(request, _)| request.starts_with("GET ")));
+    Ok(())
 }
 
 #[tokio::test]

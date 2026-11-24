@@ -480,11 +480,12 @@ impl Prompt {
         let completion_color = theme.get("ui.menu");
         let selected_color = theme.get("ui.menu.selected");
         let suggestion_color = theme.get("ui.text.inactive");
-        let background = theme.get(if self.placement.is_some() {
-            "ui.popup"
+        let background = if self.placement.is_some() {
+            // Anchored inputs sit in the chat composer and share its background.
+            super::markdown::chat_style(theme, "prompt", "ui.popup")
         } else {
-            "ui.background"
-        });
+            theme.get("ui.background")
+        };
         // completion
 
         let max_len = self

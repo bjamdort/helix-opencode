@@ -2,7 +2,9 @@ use std::{path::PathBuf, sync::Arc};
 mod interactions;
 pub(crate) mod models;
 pub(super) mod references;
+pub(crate) mod sessions;
 pub(crate) mod snippets;
+mod transcript;
 
 use arc_swap::ArcSwap;
 use helix_core::{
@@ -22,13 +24,17 @@ use tui::{
     text::{Span, Spans},
 };
 
-use super::pane::{Pane, PaneOutcome};
+use super::{
+    markdown::chat_style,
+    pane::{Pane, PaneOutcome},
+};
 use crate::{
     commands::pane::PaneCommand,
     job::Jobs,
     keymap::{macros::keymap, KeyTrie},
     opencode::{self, Connection, State},
 };
+use transcript::{ChatRow, Palette};
 
 pub(super) const ID: &str = "opencode";
 
@@ -52,6 +58,19 @@ pub(super) struct OpenCode {
 }
 
 impl OpenCode {
+    pub(super) fn session_directory(&self) -> PathBuf {
+        self.connection.state.lock().session.as_ref().map_or_else(
+            || self.directory.clone(),
+            |session| session.location.directory.clone(),
+        )
+    }
+    pub(super) fn changes_handle(&self) -> anyhow::Result<opencode::changes::ChangesHandle> {
+        self.connection.changes_handle()
+    }
+
+    pub(super) fn matches_changes_handle(&self, handle: &opencode::changes::ChangesHandle) -> bool {
+        self.connection.matches_changes_handle(handle)
+    }
     pub(super) fn model_handle(&self) -> anyhow::Result<opencode::models::ModelHandle> {
         self.connection.model_handle()
     }
@@ -250,8 +269,12 @@ impl Pane for OpenCode {
     fn keymap(&self) -> &KeyTrie {
         &self.keys
     }
-    fn max_width(&self, available: u16) -> u16 {
-        (available / 2).min(available.saturating_sub(20))
+    fn retain_on_close(&self) -> bool {
+        true
+    }
+    fn on_hide(&mut self) {
+        *self.panel.lock() = Rect::default();
+        self.input.lock().area = Rect::default();
     }
 
     fn command(&mut self, command: PaneCommand, count: usize) -> anyhow::Result<PaneOutcome> {
@@ -313,6 +336,9 @@ impl Pane for OpenCode {
             }
             PaneCommand::Close => return Ok(PaneOutcome::Close),
             PaneCommand::FocusDocument => return Ok(PaneOutcome::FocusDocument),
+            PaneCommand::OpenHorizontalSplit | PaneCommand::OpenVerticalSplit => {
+                anyhow::bail!("This action requires a file explorer pane");
+            }
             _ => self.scroll(command, count),
         }
         Ok(PaneOutcome::None)
@@ -343,27 +369,27 @@ impl Pane for OpenCode {
 
     fn render(&mut self, area: Rect, surface: &mut Buffer, editor: &Editor, focused: bool) {
         *self.panel.lock() = area;
-        let layout = ChatLayout::new(area);
-        let editing = {
-            let mut input = self.input.lock();
-            input.area = layout.input_area();
-            input.active
-        };
+        let palette = Palette::new(&editor.theme);
+        let editing = self.input.lock().active;
         let state = self.connection.state.lock();
         let draft = self.draft.lock();
         let view = ChatView {
             state: &state,
             draft: &draft,
             directory: &self.directory,
+            palette: &palette,
             theme: &editor.theme,
             loader: &editor.syn_loader,
             expanded: self.expanded,
             focused,
             editing,
             snippets: &self.snippets,
+            selecting: self.selected_reference.is_some(),
         };
+        let layout = view.layout(area);
+        self.input.lock().area = layout.input_area();
         self.viewport_height = layout.body.height.max(1) as usize;
-        let mut lines = view.transcript(layout.body.width.saturating_sub(3) as usize);
+        let mut lines = view.transcript(layout.body.width as usize);
         self.references.clear();
         self.messages.clear();
         let mut seen = std::collections::HashSet::new();
@@ -382,7 +408,6 @@ impl Pane for OpenCode {
                     self.references.push((reference.clone(), index));
                 }
                 if Some(reference) == self.selected_reference.as_ref() {
-                    row.rail = Some(editor.theme.get("ui.text.focus"));
                     if let Some(span) = row.spans.0.get_mut(*span_index) {
                         span.style = span
                             .style
@@ -423,15 +448,6 @@ impl Pane for OpenCode {
             self.follow = true;
         }
         view.render(area, surface, &layout, &lines, self.offset, self.follow);
-        if self.selected_reference.is_some() && !editing {
-            fill(layout.footer, surface, editor.theme.get("ui.background"));
-            write(
-                layout.footer,
-                surface,
-                "Enter/o open file   ]/[ select   i message",
-                editor.theme.get("ui.text.info"),
-            );
-        }
     }
 
     fn cursor(&self, area: Rect) -> (Option<Position>, CursorKind) {
@@ -442,448 +458,218 @@ impl Pane for OpenCode {
     }
 }
 
-/// Reserve the composer even when the transcript scrolls. Small terminals use
-/// compact chrome instead of allowing rectangles to overlap or underflow.
+/// The OpenCode TUI session layout: a transcript that sticks to the bottom, a
+/// reserved "Jump to latest" row, an optional request dock, and the prompt
+/// with its metadata row and footer. Small panes drop padding first so
+/// rectangles never overlap or underflow.
 struct ChatLayout {
-    header: Rect,
     body: Rect,
+    jump: Rect,
+    dock: Rect,
     composer: Rect,
+    chips: Rect,
+    input: Rect,
+    meta: Rect,
+    edge: Rect,
     footer: Rect,
 }
 
 impl ChatLayout {
-    fn new(area: Rect) -> Self {
-        let inner = area.clip_left(2).clip_right(1);
-        let header_height = if inner.height >= 12 { 3 } else { 1 }.min(inner.height);
-        let rest = inner.clip_top(header_height);
-        let footer_height = u16::from(rest.height > 0);
-        let composer_height =
-            if rest.height >= 8 { 5 } else { 3 }.min(rest.height.saturating_sub(footer_height));
+    fn new(area: Rect, input_rows: u16, chip_rows: u16, dock_rows: u16) -> Self {
+        let inner = area.clip_left(1).clip_right(1);
+        let footer_height = u16::from(inner.height > 0);
+        let rest = inner.clip_bottom(footer_height);
+        let input_rows = input_rows.max(1);
+        let roomy = pad_rows(input_rows, chip_rows) + 2 + 4 <= rest.height;
+        let (pad, chips, edge, input_rows) = if roomy {
+            (1, chip_rows, 1, input_rows)
+        } else {
+            (0, 0, 0, 1)
+        };
+        let composer_height = (pad * 2 + chips + input_rows + 1 + edge).min(rest.height);
+        let composer = Rect::new(
+            rest.x,
+            rest.bottom() - composer_height,
+            rest.width,
+            composer_height,
+        );
+        let above = rest.clip_bottom(composer_height);
+        let dock_height = if dock_rows > 0 && above.height >= dock_rows + 1 + 4 {
+            dock_rows + 1
+        } else {
+            0
+        };
+        let dock = Rect::new(
+            above.x,
+            above.bottom() - dock_height,
+            above.width,
+            dock_height.saturating_sub(1),
+        );
+        let above = above.clip_bottom(dock_height);
+        let jump_height = u16::from(above.height >= 3);
+        let jump = Rect::new(
+            above.x,
+            above.bottom() - jump_height,
+            above.width,
+            jump_height,
+        );
+        let body = above.clip_bottom(jump_height);
+        let content = composer.clip_left(3).clip_right(2);
+        let row = |offset: u16, height: u16| {
+            if offset >= composer.height {
+                Rect::new(content.x, composer.bottom(), content.width, 0)
+            } else {
+                Rect::new(
+                    content.x,
+                    composer.y + offset,
+                    content.width,
+                    height.min(composer.height - offset),
+                )
+            }
+        };
+        let chips_area = row(pad, chips);
+        let input = row(pad + chips, input_rows);
+        let meta = row(pad * 2 + chips + input_rows, 1);
+        let edge = if edge > 0 {
+            Rect::new(composer.x, composer.bottom() - 1, composer.width, 1)
+        } else {
+            Rect::new(composer.x, composer.bottom(), composer.width, 0)
+        };
         Self {
-            header: inner.with_height(header_height),
-            body: rest.clip_bottom(composer_height + footer_height),
-            composer: Rect::new(
-                rest.x,
-                rest.bottom()
-                    .saturating_sub(composer_height + footer_height),
-                rest.width,
-                composer_height,
-            ),
+            body,
+            jump,
+            dock,
+            composer,
+            chips: chips_area,
+            input,
+            meta,
+            edge,
             footer: Rect::new(
-                rest.x,
-                rest.bottom().saturating_sub(footer_height),
-                rest.width,
+                inner.x,
+                inner.bottom() - footer_height,
+                inner.width,
                 footer_height,
             ),
         }
     }
 
     fn input_area(&self) -> Rect {
-        let content = self.composer.clip_left(2).clip_right(1);
-        if content.width < 3 || content.height < 3 {
+        if self.input.width < 3 || self.input.height == 0 {
             Rect::default()
         } else {
-            content.clip_top(1).with_height(1)
+            self.input.with_height(1)
         }
     }
 }
 
-#[derive(Default)]
-struct ChatRow {
-    spans: Spans<'static>,
-    background: Style,
-    rail: Option<Style>,
-    links: Vec<(usize, references::Reference)>,
-    message: Option<String>,
-}
-
-impl ChatRow {
-    fn render(&self, area: Rect, surface: &mut Buffer) {
-        if area.width == 0 || area.height == 0 {
-            return;
-        }
-        surface.set_style(area, self.background);
-        if let Some(style) = self.rail {
-            surface.set_stringn(area.x, area.y, "┃", area.width as usize, style);
-        }
-        let text = area.clip_left(3);
-        surface.set_spans(text.x, text.y, &self.spans, text.width);
-    }
+fn pad_rows(input_rows: u16, chip_rows: u16) -> u16 {
+    2 + chip_rows + input_rows + 1
 }
 
 struct ChatView<'a> {
     state: &'a State,
     draft: &'a str,
     directory: &'a std::path::Path,
+    palette: &'a Palette,
     theme: &'a Theme,
     loader: &'a Arc<ArcSwap<syntax::Loader>>,
     expanded: bool,
     focused: bool,
     editing: bool,
     snippets: &'a [opencode::snippets::Snippet],
+    selecting: bool,
+}
+
+/// A pending permission or question, summarized above the prompt.
+struct Request {
+    question: bool,
+    detail: String,
 }
 
 impl ChatView<'_> {
-    fn transcript(&self, width: usize) -> Vec<ChatRow> {
-        let theme = self.theme;
-        let muted = theme.get("ui.text.inactive");
-        let accent = theme.get("ui.text.info");
-        let card = theme.get("ui.popup");
-        let mut lines = Vec::new();
-        for message in &self.state.messages {
-            let start = lines.len();
-            let directory = self
-                .state
-                .session
-                .as_ref()
-                .map_or(self.directory, |session| {
-                    session.location.directory.as_path()
-                });
-            match message.kind.as_str() {
-                "user" => {
-                    let display = message
-                        .metadata
-                        .as_ref()
-                        .and_then(|m| m.get("displayText"))
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or(&message.text);
-                    self.user_block(&mut lines, "You", display, width);
-                    for file in &message.files {
-                        let name = file
-                            .get("name")
-                            .and_then(serde_json::Value::as_str)
-                            .unwrap_or("Attached file");
-                        let reference =
-                            references::from_attachment(file).map(|target| references::Reference {
-                                message_id: message.id.clone(),
-                                directory: directory.to_owned(),
-                                target,
-                            });
-                        let label = reference
-                            .as_ref()
-                            .map_or_else(|| name.to_owned(), |reference| reference.target.label());
-                        let spans = Spans::from(Span::styled(format!("▧ {label}"), muted));
-                        wrap_linked_spans(&mut lines, &spans, &[reference], width);
-                    }
-                    render_selection_comments(&mut lines, message.metadata.as_ref(), width, muted);
-                }
-                "assistant" => {
-                    let agent = message.agent.as_deref().unwrap_or("Assistant");
-                    let header = message.model.as_ref().map_or_else(
-                        || format!("◆ {agent}"),
-                        |model| format!("◆ {agent}  ·  {}", model.label()),
-                    );
-                    append(
-                        &mut lines,
-                        &header,
-                        width,
-                        accent.add_modifier(Modifier::BOLD),
-                    );
-                    lines.push(ChatRow::default());
-                    let mut reads = 0;
-                    for part in &message.content {
-                        if !self.expanded
-                            && part.kind == "tool"
-                            && part.name.rsplit('.').next() == Some("read")
-                            && part
-                                .state
-                                .as_ref()
-                                .is_some_and(|tool| tool.status == "completed")
-                        {
-                            reads += 1;
-                            continue;
-                        }
-                        collapsed_reads(&mut lines, &mut reads, width, muted);
-                        match part.kind.as_str() {
-                            "text" => {
-                                let markdown = super::markdown::Markdown::new(
-                                    part.text.clone(),
-                                    self.loader.clone(),
-                                );
-                                let (text, inline) = markdown.parse_with_inline(Some(theme));
-                                for (line_index, line) in text.lines.iter().enumerate() {
-                                    let mut spans = Vec::new();
-                                    let mut links = Vec::new();
-                                    for (span_index, span) in line.0.iter().enumerate() {
-                                        let targets = inline
-                                            .iter()
-                                            .find(|item| {
-                                                item.line == line_index && item.span == span_index
-                                            })
-                                            .map(|item| {
-                                                references::inline_targets(
-                                                    &span.content,
-                                                    item.destination.as_deref(),
-                                                    item.code,
-                                                )
-                                            })
-                                            .unwrap_or_default();
-                                        let mut offset = 0;
-                                        for (range, target) in targets {
-                                            if range.start > offset {
-                                                spans.push(Span::styled(
-                                                    span.content[offset..range.start].to_owned(),
-                                                    span.style,
-                                                ));
-                                                links.push(None);
-                                            }
-                                            spans.push(Span::styled(
-                                                span.content[range.clone()].to_owned(),
-                                                span.style.underline_style(UnderlineStyle::Line),
-                                            ));
-                                            links.push(Some(references::Reference {
-                                                message_id: message.id.clone(),
-                                                directory: directory.to_owned(),
-                                                target,
-                                            }));
-                                            offset = range.end;
-                                        }
-                                        if offset < span.content.len() {
-                                            spans.push(Span::styled(
-                                                span.content[offset..].to_owned(),
-                                                span.style,
-                                            ));
-                                            links.push(None);
-                                        }
-                                    }
-                                    wrap_linked_spans(
-                                        &mut lines,
-                                        &Spans::from(spans),
-                                        &links,
-                                        width,
-                                    );
-                                }
-                            }
-                            "reasoning" => {
-                                let done = message.time.completed.is_some()
-                                    || message
-                                        .content
-                                        .iter()
-                                        .any(|p| p.kind == "text" && !p.text.is_empty());
-                                let label = if done { "Thought" } else { "Thinking…" };
-                                append(
-                                    &mut lines,
-                                    &format!("{} {label}", if self.expanded { "▾" } else { "▸" }),
-                                    width,
-                                    muted,
-                                );
-                                if self.expanded {
-                                    let start = lines.len();
-                                    append(
-                                        &mut lines,
-                                        &part.text.replace("[REDACTED]", ""),
-                                        width,
-                                        muted.add_modifier(Modifier::ITALIC),
-                                    );
-                                    for row in &mut lines[start..] {
-                                        row.rail = Some(theme.get("ui.window"));
-                                    }
-                                }
-                            }
-                            "tool" => {
-                                let tool = part.state.as_ref();
-                                let status = tool.map_or("pending", |tool| tool.status.as_str());
-                                let (icon, style) = match status {
-                                    "completed" => ("✓", theme.get("diagnostic.hint")),
-                                    "error" => ("×", theme.get("error")),
-                                    _ => ("⋯", accent),
-                                };
-                                let input = tool.and_then(|tool| tool.input.as_ref());
-                                let summary = input.and_then(|input| {
-                                    ["path", "file_path", "command", "pattern", "query"]
-                                        .iter()
-                                        .find_map(|key| {
-                                            input.get(key).and_then(serde_json::Value::as_str)
-                                        })
-                                });
-                                let label = summary.map_or_else(
-                                    || part.name.clone(),
-                                    |summary| {
-                                        let summary: String = summary
-                                            .lines()
-                                            .next()
-                                            .unwrap_or_default()
-                                            .chars()
-                                            .take(120)
-                                            .collect();
-                                        format!("{}  {}", part.name, summary)
-                                    },
-                                );
-                                let summary_start = lines.len();
-                                append(
-                                    &mut lines,
-                                    &format!("{icon} {label}  ·  {status}"),
-                                    width,
-                                    style,
-                                );
-                                if let Some(target) = input
-                                    .and_then(|input| {
-                                        ["path", "file_path", "filePath", "filename"]
-                                            .iter()
-                                            .find_map(|key| {
-                                                input.get(key).and_then(serde_json::Value::as_str)
-                                            })
-                                    })
-                                    .and_then(|path| references::parse(path, true))
-                                {
-                                    let reference = references::Reference {
-                                        message_id: message.id.clone(),
-                                        directory: directory.to_owned(),
-                                        target,
-                                    };
-                                    // Keep a tool's file target on its existing summary, not a duplicate row.
-                                    for row in &mut lines[summary_start..] {
-                                        for (index, span) in row.spans.0.iter_mut().enumerate() {
-                                            span.style =
-                                                span.style.underline_style(UnderlineStyle::Line);
-                                            row.links.push((index, reference.clone()));
-                                        }
-                                    }
-                                }
-                                if self.expanded {
-                                    let start = lines.len();
-                                    if let Some(input) = input {
-                                        preview(
-                                            &mut lines,
-                                            &format!("Input: {input}"),
-                                            width,
-                                            muted,
-                                        );
-                                    }
-                                    if let Some(tool) = tool {
-                                        for content in tool.content.iter().take(4) {
-                                            if let Some(output) = content
-                                                .get("text")
-                                                .and_then(serde_json::Value::as_str)
-                                            {
-                                                preview(&mut lines, output, width, muted);
-                                            }
-                                        }
-                                        if let Some(error) = &tool.error {
-                                            preview(
-                                                &mut lines,
-                                                &opencode::error_summary(Some(error)),
-                                                width,
-                                                theme.get("error"),
-                                            );
-                                        }
-                                    }
-                                    for row in &mut lines[start..] {
-                                        row.background = card;
-                                        row.rail = Some(theme.get("ui.window"));
-                                    }
-                                }
-                            }
-                            _ => (),
-                        }
-                    }
-                    collapsed_reads(&mut lines, &mut reads, width, muted);
-                    if let Some(error) = &message.error {
-                        append(
-                            &mut lines,
-                            &opencode::error_summary(Some(error)),
-                            width,
-                            theme.get("error"),
-                        );
-                    }
-                }
-                "compaction" => append(&mut lines, "── Context compacted ──", width, muted),
-                _ => continue,
-            }
-            for row in &mut lines[start..] {
-                row.message = Some(message.id.clone());
-            }
-            lines.push(ChatRow::default());
-        }
-        for pending in &self.state.pending {
-            let status = if pending.failed {
-                "delivery uncertain"
-            } else if pending.accepted {
-                "queued"
-            } else {
-                "sending…"
-            };
-            self.user_block(
-                &mut lines,
-                &format!("You  ·  {status}"),
-                &pending.text,
-                width,
-            );
-            for snippet in &pending.snippets {
-                append(&mut lines, &format!("▧ {}", snippet.label()), width, muted);
-                if !snippet.comment.is_empty() {
-                    append(
-                        &mut lines,
-                        &format!("  ↳ {}", snippet.comment),
-                        width,
-                        muted,
-                    );
-                }
-            }
-            if pending.snippets.is_empty() {
-                for file in &pending.files {
-                    let label = references::from_attachment(file)
-                        .map(|target| target.label())
-                        .unwrap_or_else(|| {
-                            file.get("name")
-                                .and_then(serde_json::Value::as_str)
-                                .unwrap_or("Attached file")
-                                .to_owned()
-                        });
-                    append(&mut lines, &format!("▧ {label}"), width, muted);
-                }
-                render_selection_comments(&mut lines, pending.metadata.as_ref(), width, muted);
-            }
-            lines.push(ChatRow::default());
-        }
-        let mut notices: Vec<_> = self.state.notices.iter().collect();
-        notices.sort_by_key(|(id, _)| *id);
-        for (_, notice) in notices {
-            append(
-                &mut lines,
-                &format!("! {notice}"),
-                width,
-                theme.get("warning"),
-            );
-        }
-        if let Some(error) = &self.state.error {
-            let start = lines.len();
-            append(
-                &mut lines,
-                "Connection / execution error",
-                width,
-                theme.get("error").add_modifier(Modifier::BOLD),
-            );
-            append(&mut lines, error, width, theme.get("error"));
-            for row in &mut lines[start..] {
-                row.rail = Some(theme.get("error"));
-            }
-        }
-        if self.state.busy {
-            append(&mut lines, "⋯ Working…   c interrupt", width, muted);
-        }
-        // Keep the final row tight so auto-follow does not hide useful content.
-        if lines.last().is_some_and(|row| row.spans.0.is_empty()) {
-            lines.pop();
-        }
-        lines
+    fn session_directory(&self) -> &std::path::Path {
+        self.state
+            .session
+            .as_ref()
+            .map_or(self.directory, |session| {
+                session.location.directory.as_path()
+            })
     }
 
-    fn user_block(&self, lines: &mut Vec<ChatRow>, label: &str, text: &str, width: usize) {
-        let start = lines.len();
-        lines.push(ChatRow::default());
-        append(
-            lines,
-            label,
+    fn transcript(&self, width: usize) -> Vec<ChatRow> {
+        transcript::build(
+            transcript::TranscriptInput {
+                state: self.state,
+                palette: self.palette,
+                theme: self.theme,
+                loader: self.loader,
+                directory: self.session_directory(),
+                expanded: self.expanded,
+            },
             width,
-            self.theme.get("ui.text.focus").add_modifier(Modifier::BOLD),
-        );
-        append(lines, text, width, self.theme.get("ui.text"));
-        lines.push(ChatRow::default());
-        for row in &mut lines[start..] {
-            row.background = self.theme.get("ui.popup");
-            row.rail = Some(self.theme.get("ui.text.info"));
+        )
+    }
+
+    fn input_width(area: Rect) -> usize {
+        area.width.saturating_sub(2 + 5) as usize
+    }
+
+    /// The idle preview of the draft, or a placeholder.
+    fn draft_rows(&self, width: usize) -> Vec<ChatRow> {
+        let mut rows = Vec::new();
+        let (text, style) = if !self.draft.is_empty() {
+            (self.draft, self.palette.text)
+        } else if self.state.connected {
+            ("Ask anything…", self.palette.muted)
+        } else if self.state.status.starts_with("Connecting") {
+            ("Connecting to OpenCode…", self.palette.muted)
+        } else {
+            ("Press r to reconnect", self.palette.muted)
+        };
+        for line in text.replace('\t', "    ").split('\n') {
+            transcript::wrap(
+                &mut rows,
+                &Spans::from(Span::styled(line, style)),
+                &[],
+                width.max(1),
+                0,
+            );
         }
+        rows
+    }
+
+    fn requests(&self) -> Vec<Request> {
+        self.state
+            .permissions
+            .values()
+            .map(|permission| Request {
+                question: false,
+                detail: match permission.resources.first() {
+                    Some(resource) => format!("{} {resource}", permission.action),
+                    None => permission.action.clone(),
+                },
+            })
+            .chain(self.state.forms.values().map(|form| Request {
+                question: true,
+                detail: form.title.clone(),
+            }))
+            .collect()
+    }
+
+    fn layout(&self, area: Rect) -> ChatLayout {
+        let input_rows = if self.editing {
+            1
+        } else {
+            self.draft_rows(Self::input_width(area)).len().clamp(1, 3) as u16
+        };
+        let requests = self.requests().len().min(2) as u16;
+        let dock_rows = if requests == 0 { 0 } else { 4 + requests };
+        ChatLayout::new(
+            area,
+            input_rows,
+            u16::from(!self.snippets.is_empty()),
+            dock_rows,
+        )
     }
 
     fn render(
@@ -895,119 +681,13 @@ impl ChatView<'_> {
         offset: usize,
         follow: bool,
     ) {
-        let theme = self.theme;
-        fill(area, surface, theme.get("ui.background"));
-        for y in area.y..area.bottom() {
-            surface.set_stringn(area.x, y, "│", area.width as usize, theme.get("ui.window"));
-        }
+        let palette = self.palette;
+        fill(area, surface, palette.page);
         if area.width < 6 || area.height == 0 {
             return;
         }
-        let accent = theme.get("ui.text.info");
-        let muted = theme.get("ui.text.inactive");
-        let header = layout.header;
-        let status = if !self.state.connected && self.state.status.starts_with("Connecting") {
-            "◐ Connecting"
-        } else if !self.state.connected {
-            "○ Offline"
-        } else if !self.state.notices.is_empty() {
-            "◐ Needs input"
-        } else if self.state.busy {
-            "◐ Running"
-        } else if self.state.error.is_some() {
-            "× Error"
-        } else {
-            "● Ready"
-        };
-        let status_style = if self.state.error.is_some() {
-            theme.get("error")
-        } else if !self.state.notices.is_empty() {
-            theme.get("warning")
-        } else {
-            accent
-        };
-        split_line(
-            header,
-            surface,
-            "OpenCode",
-            status,
-            theme.get("ui.text").add_modifier(Modifier::BOLD),
-            status_style,
-        );
-        if header.height >= 3 {
-            let title = self
-                .state
-                .session
-                .as_ref()
-                .and_then(|session| {
-                    session
-                        .title
-                        .as_deref()
-                        .filter(|title| !title.is_empty())
-                        .or_else(|| {
-                            (!self.state.messages.is_empty()).then_some(session.id.as_str())
-                        })
-                })
-                .unwrap_or("New conversation");
-            write(
-                header.clip_top(1).with_height(1),
-                surface,
-                title,
-                theme.get("ui.text"),
-            );
-            let directory = self
-                .state
-                .session
-                .as_ref()
-                .map_or(self.directory, |session| {
-                    session.location.directory.as_path()
-                });
-            let project = directory
-                .file_name()
-                .unwrap_or(directory.as_os_str())
-                .to_string_lossy();
-            split_line(
-                header.clip_top(2).with_height(1),
-                surface,
-                &project,
-                if follow { "" } else { "↑ history" },
-                muted,
-                accent,
-            );
-        }
         if lines.is_empty() && layout.body.height > 3 {
-            let y = layout.body.y + layout.body.height.saturating_sub(6) / 2;
-            let welcome = layout.body.clip_top(y - layout.body.y);
-            write(
-                welcome.with_height(1).clip_left(3),
-                surface,
-                "What would you like to work on?",
-                accent.add_modifier(Modifier::BOLD),
-            );
-            if welcome.height >= 3 {
-                write(
-                    welcome.clip_top(2).with_height(1).clip_left(3),
-                    surface,
-                    "Ask about code, plan a change,",
-                    muted,
-                );
-            }
-            if welcome.height >= 4 {
-                write(
-                    welcome.clip_top(3).with_height(1).clip_left(3),
-                    surface,
-                    "or work through a problem.",
-                    muted,
-                );
-            }
-            if welcome.height >= 6 {
-                write(
-                    welcome.clip_top(5).with_height(1).clip_left(3),
-                    surface,
-                    "i  compose a message",
-                    theme.get("ui.text"),
-                );
-            }
+            self.welcome(layout.body, surface);
         } else {
             for (index, row) in lines
                 .iter()
@@ -1025,110 +705,429 @@ impl ChatView<'_> {
                     surface,
                 );
             }
-            // A small position indicator, without taking another transcript row.
-            if !follow && layout.body.height > 0 && layout.body.width > 0 {
-                let y = layout.body.y
-                    + ((offset as u64 * layout.body.height.saturating_sub(1) as u64)
-                        / lines.len().max(1) as u64) as u16;
-                surface.set_string(layout.body.right() - 1, y, "▐", accent);
-            }
         }
-        let composer = layout.composer;
-        fill(composer, surface, theme.get("ui.popup"));
-        let border = if self.focused {
-            accent
+        if !follow {
+            let label = "Jump to latest ↓";
+            let width = (label.width() as u16).min(layout.jump.width);
+            write(
+                Rect::new(
+                    layout.jump.right() - width,
+                    layout.jump.y,
+                    width,
+                    layout.jump.height,
+                ),
+                surface,
+                label,
+                palette.muted,
+            );
+        }
+        self.dock(layout.dock, surface);
+        self.composer(layout, surface);
+        self.footer(layout.footer, surface);
+    }
+
+    fn welcome(&self, body: Rect, surface: &mut Buffer) {
+        let palette = self.palette;
+        let y = body.y + body.height.saturating_sub(4) / 2;
+        let area = body.clip_top(y - body.y).clip_left(transcript::INDENT);
+        write(
+            area.with_height(1),
+            surface,
+            "What would you like to work on?",
+            palette.text.add_modifier(Modifier::BOLD),
+        );
+        if area.height >= 3 {
+            write(
+                area.clip_top(2).with_height(1),
+                surface,
+                "Ask about code, plan a change,",
+                palette.muted,
+            );
+        }
+        if area.height >= 4 {
+            write(
+                area.clip_top(3).with_height(1),
+                surface,
+                "or work through a problem.",
+                palette.muted,
+            );
+        }
+    }
+
+    /// Pending requests replace the TUI's prompt; here they sit above it,
+    /// because answering happens in the request list.
+    fn dock(&self, area: Rect, surface: &mut Buffer) {
+        if area.height == 0 {
+            return;
+        }
+        let palette = self.palette;
+        let requests = self.requests();
+        surface.set_style(area, palette.panel);
+        for y in area.y..area.bottom() {
+            surface.set_stringn(area.x, y, "┃", 1, palette.accent);
+        }
+        let content = area.clip_left(3).clip_right(2).clip_top(1);
+        let title = if requests.iter().all(|request| request.question) {
+            "Question"
         } else {
-            theme.get("ui.window")
+            "Permission required"
         };
-        for y in composer.y..composer.bottom() {
-            surface.set_stringn(composer.x, y, "┃", composer.width as usize, border);
+        draw_spans(
+            content.with_height(1),
+            surface,
+            &[
+                Span::styled("△ ", palette.warning),
+                Span::styled(title, palette.text),
+            ],
+        );
+        for (index, request) in requests.iter().take(2).enumerate() {
+            let icon = if request.question { "?" } else { "→" };
+            write(
+                content.clip_top(1 + index as u16).with_height(1),
+                surface,
+                &format!("{icon} {}", request.detail),
+                palette.muted,
+            );
         }
-        let content = composer.clip_left(2).clip_right(1);
-        if content.height > 0 {
-            let title = if self.snippets.is_empty() {
-                if self.editing {
-                    "Message  ·  editing".to_owned()
-                } else if self.draft.is_empty() {
-                    "Message".to_owned()
-                } else {
-                    "Message  ·  draft".to_owned()
-                }
-            } else {
+        let shown = requests.len().min(2) as u16;
+        let mut hints = vec![
+            Span::styled("p", palette.text),
+            Span::styled(" respond", palette.muted),
+        ];
+        if requests.len() > 2 {
+            hints.push(Span::styled(
+                format!("  +{} more", requests.len() - 2),
+                palette.muted,
+            ));
+        }
+        draw_spans(content.clip_top(1 + shown).with_height(1), surface, &hints);
+    }
+
+    fn composer(&self, layout: &ChatLayout, surface: &mut Buffer) {
+        let palette = self.palette;
+        let composer = layout.composer;
+        if composer.height == 0 {
+            return;
+        }
+        let card = composer.clip_bottom(layout.edge.height);
+        surface.set_style(card, palette.prompt);
+        let bar = if self.focused {
+            palette.agent
+        } else {
+            palette.border
+        };
+        for y in card.y..card.bottom() {
+            surface.set_stringn(card.x, y, "┃", 1, bar);
+        }
+        if layout.edge.height > 0 {
+            // A half-height lower edge, as the TUI draws it.
+            let edge = layout.edge;
+            surface.set_stringn(edge.x, edge.y, "╹", 1, bar);
+            let lower = Style {
+                fg: palette.prompt.bg,
+                ..palette.page
+            };
+            let width = edge.width.saturating_sub(1) as usize;
+            surface.set_stringn(edge.x + 1, edge.y, &"▀".repeat(width), width, lower);
+        }
+        if layout.chips.height > 0 {
+            if let Some(first) = self.snippets.first() {
                 let comments = self
                     .snippets
                     .iter()
                     .filter(|snippet| !snippet.comment.is_empty())
                     .count();
-                format!(
-                    "Message · {} snippet(s), {comments} comment(s): {}",
-                    self.snippets.len(),
-                    self.snippets[0].label()
-                )
-            };
-            write(content.with_height(1), surface, &title, muted);
+                let mut spans = vec![
+                    Span::styled(
+                        " file ",
+                        Style {
+                            fg: palette.page.bg,
+                            bg: palette.accent.fg,
+                            ..Style::default()
+                        }
+                        .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        format!(" {} ", first.label()),
+                        palette.panel.patch(Style {
+                            fg: palette.muted.fg,
+                            ..Style::default()
+                        }),
+                    ),
+                ];
+                if self.snippets.len() > 1 {
+                    spans.push(Span::styled(
+                        format!(" +{}", self.snippets.len() - 1),
+                        palette.muted,
+                    ));
+                }
+                if comments > 0 {
+                    spans.push(Span::styled(
+                        format!(
+                            " · {comments} comment{}",
+                            if comments == 1 { "" } else { "s" }
+                        ),
+                        palette.muted,
+                    ));
+                }
+                draw_spans(layout.chips, surface, &spans);
+            }
         }
-        if content.height > 2 && !self.editing {
-            let mut draft_lines = Vec::new();
-            append(
-                &mut draft_lines,
-                if self.draft.is_empty() {
-                    if !self.state.connected {
-                        "r  connect to OpenCode"
-                    } else if self.state.busy {
-                        "Steer the conversation…"
-                    } else {
-                        "Ask OpenCode…  (i / Enter)"
-                    }
-                } else {
-                    self.draft
-                },
-                content.width as usize,
-                if self.draft.is_empty() {
-                    muted
-                } else {
-                    theme.get("ui.text")
-                },
-            );
-            for (index, row) in draft_lines
-                .iter()
-                .take(content.height.saturating_sub(2) as usize)
-                .enumerate()
-            {
+        if !self.editing {
+            let rows = self.draft_rows(layout.input.width as usize);
+            for (index, row) in rows.iter().take(layout.input.height as usize).enumerate() {
                 surface.set_spans(
-                    content.x,
-                    content.y + 1 + index as u16,
+                    layout.input.x,
+                    layout.input.y + index as u16,
                     &row.spans,
-                    content.width,
+                    layout.input.width,
                 );
             }
         }
-        if content.height > 1 {
-            let session = self.state.session.as_ref();
-            let agent = session
-                .and_then(|s| s.agent.as_deref())
-                .unwrap_or("Default agent");
-            let model = session
-                .and_then(|s| s.model.as_ref())
-                .map_or_else(|| "Server default".to_owned(), |m| m.label());
-            split_line(
-                Rect::new(content.x, content.bottom() - 1, content.width, 1),
-                surface,
-                agent,
-                &model,
-                accent,
-                muted,
-            );
+        if layout.meta.height > 0 {
+            draw_spans(layout.meta, surface, &self.metadata(layout.meta.width));
         }
-        let hints = if self.editing {
-            "Enter send   Esc cancel"
-        } else if self.state.busy {
-            "i steer   c interrupt   q close"
-        } else if self.expanded {
-            "i message   t hide details   n new"
-        } else {
-            "i message   f files   ]/[ refs   J/K chat"
+    }
+
+    /// `Build · model provider · variant`, falling back to the last step's selection.
+    fn metadata(&self, width: u16) -> Vec<Span<'static>> {
+        let palette = self.palette;
+        let session = self.state.session.as_ref();
+        let last = self
+            .state
+            .messages
+            .iter()
+            .rev()
+            .find(|message| message.kind == "assistant");
+        let agent = session
+            .and_then(|session| session.agent.as_deref())
+            .or_else(|| last.and_then(|message| message.agent.as_deref()));
+        let model = session
+            .and_then(|session| session.model.as_ref())
+            .or_else(|| last.and_then(|message| message.model.as_ref()));
+        let mut spans = Vec::new();
+        if let Some(agent) = agent.filter(|_| width >= 44) {
+            spans.push(Span::styled(transcript::titlecase(agent), palette.agent));
+            spans.push(Span::styled(" · ", palette.muted));
+        }
+        match model {
+            Some(model) => {
+                spans.push(Span::styled(model.model.clone(), palette.text));
+                if width >= 44 {
+                    spans.push(Span::styled(format!(" {}", model.provider), palette.muted));
+                }
+                if let Some(variant) = model
+                    .variant
+                    .as_deref()
+                    .filter(|variant| *variant != "default")
+                {
+                    spans.push(Span::styled(" · ", palette.muted));
+                    spans.push(Span::styled(
+                        variant.to_owned(),
+                        palette.warning.add_modifier(Modifier::BOLD),
+                    ));
+                }
+            }
+            None => spans.push(Span::styled("Default model", palette.muted)),
+        }
+        spans
+    }
+
+    fn usage(&self) -> Option<String> {
+        let tokens = self
+            .state
+            .messages
+            .iter()
+            .rev()
+            .filter(|message| message.kind == "assistant")
+            .find_map(|message| message.tokens.filter(|tokens| tokens.total() > 0.0))
+            .map(|tokens| tokens.total());
+        let cost: f64 = self
+            .state
+            .messages
+            .iter()
+            .filter_map(|message| message.cost)
+            .sum();
+        let mut parts = Vec::new();
+        if let Some(tokens) = tokens {
+            parts.push(transcript::number(tokens));
+        }
+        if cost > 0.0 {
+            parts.push(format!("${cost:.2}"));
+        }
+        (!parts.is_empty()).then(|| parts.join(" · "))
+    }
+
+    /// Running state or location on the left; usage and key hints on the right.
+    fn footer(&self, area: Rect, surface: &mut Buffer) {
+        if area.height == 0 || area.width == 0 {
+            return;
+        }
+        let palette = self.palette;
+        let key = |key: &'static str, label: &'static str| {
+            [
+                Span::styled(key, palette.text),
+                Span::styled(label, palette.muted),
+            ]
         };
-        write(layout.footer, surface, hints, muted);
+        let hints: Vec<Span> = if self.editing {
+            [key("enter", " send  "), key("esc", " cancel")].concat()
+        } else if self.selecting {
+            [
+                key("enter", " open  "),
+                key("]/[", " select  "),
+                key("i", " write"),
+            ]
+            .concat()
+        } else if self.expanded {
+            [key("i", " write  "), key("t", " less  "), key("q", " hide")].concat()
+        } else {
+            [
+                key("i", " write  "),
+                key("t", " details  "),
+                key("q", " hide"),
+            ]
+            .concat()
+        };
+        let mut right = Vec::new();
+        if let Some(usage) = self.usage() {
+            right.push(Span::styled(format!("{usage}  "), palette.muted));
+        }
+        right.extend(hints.iter().cloned());
+        let left = self.status();
+        let left_width = spans_width(&left).min(area.width as usize / 2).max(12);
+        let budget = (area.width as usize).saturating_sub(left_width + 2);
+        // Drop usage, then all hints, when the footer is narrow.
+        let right = if spans_width(&right) <= budget {
+            right
+        } else if spans_width(&hints) <= budget {
+            hints
+        } else {
+            Vec::new()
+        };
+        let right_width = spans_width(&right) as u16;
+        draw_spans(
+            Rect::new(area.right() - right_width, area.y, right_width, 1),
+            surface,
+            &right,
+        );
+        let left_area = area.with_width(area.width.saturating_sub(right_width + 2));
+        draw_spans(left_area, surface, &left);
+    }
+
+    fn status(&self) -> Vec<Span<'static>> {
+        let palette = self.palette;
+        if !self.state.connected {
+            if self.state.status.starts_with("Connecting") {
+                return vec![Span::styled(
+                    format!("{} Connecting…", transcript::spinner_frame()),
+                    palette.muted,
+                )];
+            }
+            return vec![
+                Span::styled("○ Offline  ", palette.error),
+                Span::styled("r", palette.text),
+                Span::styled(" reconnect", palette.muted),
+            ];
+        }
+        if self.state.busy {
+            let mut spans = vec![Span::raw(" ")];
+            spans.extend(scanner(palette));
+            spans.push(Span::styled(" c", palette.text));
+            spans.push(Span::styled(" interrupt", palette.muted));
+            return spans;
+        }
+        vec![Span::styled(
+            home_relative(self.session_directory()),
+            palette.muted,
+        )]
+    }
+}
+
+/// The TUI's eight-cell "knight rider" activity indicator.
+fn scanner(palette: &Palette) -> Vec<Span<'static>> {
+    const CELLS: u64 = 8;
+    let tick = opencode::now_millis() / opencode::SPINNER_INTERVAL_MS;
+    let phase = tick % (CELLS * 2 - 2);
+    let forward = phase < CELLS;
+    let head = if forward {
+        phase
+    } else {
+        CELLS * 2 - 2 - phase
+    };
+    (0..CELLS)
+        .map(|cell| {
+            let trail = if forward {
+                cell + 1 == head
+            } else {
+                cell == head + 1
+            };
+            if cell == head {
+                Span::styled("■", palette.agent)
+            } else if trail {
+                Span::styled("■", palette.agent.add_modifier(Modifier::DIM))
+            } else {
+                Span::styled("⬝", palette.muted)
+            }
+        })
+        .collect()
+}
+
+fn home_relative(path: &std::path::Path) -> String {
+    helix_stdx::path::fold_home_dir(path)
+        .to_string_lossy()
+        .trim_end_matches('/')
+        .to_owned()
+}
+
+/// Plain wrapped rows for pane-local views, inset from the panel edge.
+fn append(lines: &mut Vec<ChatRow>, text: &str, width: usize, style: Style) {
+    for line in text.replace('\t', "    ").split('\n') {
+        let start = lines.len();
+        transcript::wrap(
+            lines,
+            &Spans::from(Span::styled(line, style)),
+            &[],
+            width,
+            0,
+        );
+        for row in &mut lines[start..] {
+            row.indent = 2;
+        }
+    }
+}
+
+fn spans_width(spans: &[Span<'_>]) -> usize {
+    spans.iter().map(|span| span.content.width()).sum()
+}
+
+fn draw_spans(area: Rect, surface: &mut Buffer, spans: &[Span<'_>]) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let mut x = area.x;
+    for span in spans {
+        let available = area.right().saturating_sub(x);
+        if available == 0 {
+            break;
+        }
+        let width = span.content.width() as u16;
+        if width > available {
+            write(
+                Rect::new(x, area.y, available, 1),
+                surface,
+                &span.content,
+                span.style,
+            );
+            break;
+        }
+        write(
+            Rect::new(x, area.y, width, 1),
+            surface,
+            &span.content,
+            span.style,
+        );
+        x += width;
     }
 }
 
@@ -1147,176 +1146,28 @@ fn write(area: Rect, surface: &mut Buffer, text: &str, style: Style) {
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let mut rows = Vec::new();
-    append(&mut rows, text, area.width as usize, style);
-    if let Some(row) = rows.first() {
-        surface.set_spans(area.x, area.y, &row.spans, area.width);
-    }
-}
-
-fn split_line(
-    area: Rect,
-    surface: &mut Buffer,
-    left: &str,
-    right: &str,
-    left_style: Style,
-    right_style: Style,
-) {
-    if area.width == 0 || area.height == 0 {
-        return;
-    }
-    let right_width = right.width().min(area.width as usize) as u16;
-    let left_width = area.width.saturating_sub(right_width.saturating_add(2));
-    // At narrow widths, keep the primary label rather than the secondary one.
-    if left_width < 8 {
-        write(area, surface, left, left_style);
-    } else {
-        write(area.with_width(left_width), surface, left, left_style);
-        write(
-            Rect::new(area.right() - right_width, area.y, right_width, 1),
-            surface,
-            right,
-            right_style,
-        );
-    }
-}
-
-fn append(lines: &mut Vec<ChatRow>, text: &str, width: usize, style: Style) {
-    for line in text.replace('\t', "    ").split('\n') {
-        wrap_spans(lines, &Spans::from(Span::styled(line, style)), width);
-    }
-}
-
-fn render_selection_comments(
-    lines: &mut Vec<ChatRow>,
-    metadata: Option<&serde_json::Value>,
-    width: usize,
-    style: Style,
-) {
-    let Some(comments) = metadata
-        .and_then(|m| m.get("comments"))
-        .and_then(serde_json::Value::as_array)
-    else {
-        return;
-    };
-    for item in comments {
-        let Some(comment) = item
-            .get("comment")
-            .and_then(serde_json::Value::as_str)
-            .filter(|text| !text.trim().is_empty())
-        else {
-            continue;
-        };
-        let path = item
-            .get("path")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("Quoted selection");
-        let line = item
-            .get("selection")
-            .and_then(|s| s.get("startLine"))
-            .and_then(serde_json::Value::as_u64);
-        let label = line.map_or_else(|| path.to_owned(), |line| format!("{path}:{line}"));
-        append(lines, &format!("  ↳ {label}: {comment}"), width, style);
-    }
-}
-
-fn collapsed_reads(lines: &mut Vec<ChatRow>, count: &mut usize, width: usize, style: Style) {
-    if *count > 0 {
-        append(
-            lines,
-            &format!(
-                "▸ Read {} file{}  ·  t details",
-                count,
-                if *count == 1 { "" } else { "s" }
-            ),
-            width,
-            style,
-        );
-        *count = 0;
-    }
-}
-
-/// Preserve inline Markdown styling when wrapping, and never pass terminal
-/// control sequences or an over-wide glyph into the compositor.
-fn wrap_spans(lines: &mut Vec<ChatRow>, spans: &Spans<'_>, width: usize) {
-    wrap_linked_spans(lines, spans, &[], width);
-}
-
-fn wrap_linked_spans(
-    lines: &mut Vec<ChatRow>,
-    spans: &Spans<'_>,
-    links: &[Option<references::Reference>],
-    width: usize,
-) {
-    if width == 0 {
-        return;
-    }
-    let mut current: Vec<Span<'static>> = Vec::new();
-    let mut current_links = Vec::new();
+    // Chrome is single-line: ellipsize instead of silently showing only the
+    // first wrapped row. Strip controls and truncate only at grapheme boundaries.
+    let clean: String = text
+        .replace('\t', "    ")
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect();
+    let truncated = clean.width() > area.width as usize;
+    let available = area.width as usize - usize::from(truncated);
+    let mut label = String::new();
     let mut used = 0;
-    for (span_index, span) in spans.0.iter().enumerate() {
-        let reference = links.get(span_index).and_then(Option::as_ref);
-        for word in span.content.split_word_bounds() {
-            if used > 0 && word.width() <= width && used + word.width() > width {
-                lines.push(ChatRow {
-                    spans: Spans::from(std::mem::take(&mut current)),
-                    links: std::mem::take(&mut current_links),
-                    ..ChatRow::default()
-                });
-                used = 0;
-                if word.chars().all(char::is_whitespace) {
-                    continue;
-                }
-            }
-            for grapheme in word.graphemes(true) {
-                let size = grapheme.width();
-                if grapheme.chars().any(char::is_control) || size > width {
-                    continue;
-                }
-                if used + size > width {
-                    lines.push(ChatRow {
-                        spans: Spans::from(std::mem::take(&mut current)),
-                        links: std::mem::take(&mut current_links),
-                        ..ChatRow::default()
-                    });
-                    used = 0;
-                }
-                let last_reference = current_links
-                    .last()
-                    .filter(|(index, _)| *index + 1 == current.len())
-                    .map(|(_, reference)| reference);
-                if let Some(last) = current
-                    .last_mut()
-                    .filter(|last| last.style == span.style && last_reference == reference)
-                {
-                    last.content.to_mut().push_str(grapheme);
-                } else {
-                    if let Some(reference) = reference {
-                        current_links.push((current.len(), reference.clone()));
-                    }
-                    current.push(Span::styled(grapheme.to_owned(), span.style));
-                }
-                used += size;
-            }
+    for grapheme in clean.graphemes(true) {
+        if used + grapheme.width() > available {
+            break;
         }
+        label.push_str(grapheme);
+        used += grapheme.width();
     }
-    lines.push(ChatRow {
-        spans: Spans::from(current),
-        links: current_links,
-        ..ChatRow::default()
-    });
-}
-
-fn preview(lines: &mut Vec<ChatRow>, text: &str, width: usize, style: Style) {
-    let mut rows = Vec::new();
-    // Bound tool output even if a service returns a very large result.
-    let snippet: String = text.chars().take(2048).collect();
-    append(&mut rows, &snippet, width, style);
-    let truncated = rows.len() > 8 || snippet.len() < text.len();
-    lines.extend(rows.into_iter().take(8));
     if truncated {
-        append(lines, "… preview truncated", width, style);
+        label.push('…');
     }
+    surface.set_stringn(area.x, area.y, &label, area.width as usize, style);
 }
 
 #[cfg(test)]
@@ -1332,10 +1183,19 @@ mod tests {
         Arc::new(ArcSwap::from_pointee(syntax::Loader::default()))
     }
 
-    fn view<'a>(state: &'a State, loader: &'a Arc<ArcSwap<syntax::Loader>>) -> ChatView<'a> {
+    fn palette() -> Palette {
+        Palette::new(&helix_view::theme::DEFAULT_THEME)
+    }
+
+    fn view<'a>(
+        state: &'a State,
+        loader: &'a Arc<ArcSwap<syntax::Loader>>,
+        palette: &'a Palette,
+    ) -> ChatView<'a> {
         ChatView {
             state,
             loader,
+            palette,
             draft: "",
             directory: std::path::Path::new("/work/helix"),
             theme: &helix_view::theme::DEFAULT_THEME,
@@ -1343,6 +1203,7 @@ mod tests {
             focused: true,
             editing: false,
             snippets: &[],
+            selecting: false,
         }
     }
 
@@ -1352,6 +1213,10 @@ mod tests {
             .iter()
             .map(|span| span.content.as_ref())
             .collect()
+    }
+
+    fn text(rows: &[ChatRow]) -> String {
+        rows.iter().map(row_text).collect::<Vec<_>>().join("\n")
     }
 
     fn screen(surface: &Buffer) -> String {
@@ -1366,8 +1231,17 @@ mod tests {
             .join("\n")
     }
 
+    fn assistant(content: Vec<serde_json::Value>) -> Message {
+        Message {
+            id: "msg_assistant".into(),
+            kind: "assistant".into(),
+            content: content.into_iter().map(part).collect(),
+            ..Message::default()
+        }
+    }
+
     #[test]
-    fn transcript_has_roles_wraps_unicode_and_keeps_errors_visible() {
+    fn user_messages_are_shaded_blocks_with_an_agent_rail() {
         let mut state = State::default();
         state.messages.push(Message {
             id: "msg_user".into(),
@@ -1376,79 +1250,286 @@ mod tests {
             ..Message::default()
         });
         state.error = Some("connection failed".into());
-        let theme = &helix_view::theme::DEFAULT_THEME;
-        let loader = loader();
-        let lines = view(&state, &loader).transcript(8);
-        assert!(lines.iter().any(|row| row_text(row) == "You"));
-        assert!(lines.iter().all(|row| row.spans.width() <= 8));
-        assert!(lines.iter().any(|row| row
-            .spans
-            .0
+        let (loader, palette) = (loader(), palette());
+        let rows = view(&state, &loader, &palette).transcript(12);
+        assert!(
+            !text(&rows).contains("You"),
+            "The TUI does not label user messages"
+        );
+        let first = rows
             .iter()
-            .any(|span| span.style == theme.get("error"))));
+            .position(|row| row_text(row).contains("hello"))
+            .unwrap();
+        assert_eq!(rows[first].indent, transcript::INDENT);
+        assert_eq!(rows[first].rail.map(|(column, _)| column), Some(0));
+        assert!(rows[first].fill.is_some());
+        assert!(rows[first - 1].fill.is_some(), "Padding row above the text");
+        assert!(rows
+            .iter()
+            .all(|row| row.spans.width() + row.indent as usize <= 12));
+        let wide = view(&state, &loader, &palette).transcript(40);
+        assert!(text(&wide).contains("Error: connection failed"));
+        assert!(wide
+            .iter()
+            .flat_map(|row| &row.spans.0)
+            .any(|span| span.content.contains("connection") && span.style == palette.error));
         let mut narrow = Vec::new();
-        append(&mut narrow, "世a\u{1b}", 1, Style::default());
+        transcript::wrap(&mut narrow, &Spans::from(Span::raw("世a\u{1b}")), &[], 1, 0);
         assert!(narrow
             .iter()
             .all(|row| row.spans.width() <= 1 && !row_text(row).contains('\u{1b}')));
     }
 
     #[test]
-    fn markdown_preserves_emphasis_lists_and_code_without_fences() {
+    fn markdown_colors_and_nested_emphasis_follow_the_editor_theme() {
         let mut state = State::default();
-        state.messages.push(Message {
-            kind: "assistant".into(),
-            content: vec![part(serde_json::json!({"type":"text", "text":"## Summary\n\n**Important** and `code`.\n\n- First\n- Second\n\n```rust\nlet answer = 42;\n```"}))],
-            ..Message::default()
-        });
-        let loader = loader();
-        let rows = view(&state, &loader).transcript(40);
-        let output = rows.iter().map(row_text).collect::<Vec<_>>().join("\n");
-        assert!(output.contains("Summary"));
-        assert!(output.contains("• First"));
-        assert!(output.contains("let answer = 42;"));
-        assert!(!output.contains("```"));
-        assert!(!output.contains("**Important**"));
+        state.messages.push(assistant(vec![serde_json::json!({"type":"text","text":
+            "## Colorful **heading**\n\n**Important _detail_** and `code` with [website](https://example.com).\n\n- First item"
+        })]));
+        let (loader, palette) = (loader(), palette());
+        let chat = view(&state, &loader, &palette);
+        let rows = chat.transcript(120);
+        let spans: Vec<_> = rows.iter().flat_map(|row| &row.spans.0).collect();
+        let styled = |text: &str| {
+            spans
+                .iter()
+                .find(|span| span.content.contains(text))
+                .unwrap()
+                .style
+        };
+        let theme = chat.theme;
+        assert_eq!(styled("Colorful").fg, theme.get("markup.heading").fg);
+        assert_eq!(styled("Important").fg, theme.get("constant").fg);
+        assert_eq!(styled("detail").fg, theme.get("constant").fg);
+        assert!(styled("detail")
+            .add_modifier
+            .contains(Modifier::BOLD | Modifier::ITALIC));
+        assert_eq!(styled("code").fg, theme.get("markup.raw").fg);
+        assert_eq!(styled("website").fg, theme.get("function").fg);
+        assert_eq!(
+            styled("website").underline_style,
+            Some(UnderlineStyle::Line)
+        );
+        assert_eq!(styled("•").fg, theme.get("function").fg);
         assert!(rows
             .iter()
-            .flat_map(|row| &row.spans.0)
-            .any(|span| span.content == "Important"
-                && span.style.add_modifier.contains(Modifier::BOLD)));
+            .filter(|row| !row.spans.0.is_empty())
+            .all(|row| row.indent == transcript::INDENT));
     }
 
     #[test]
-    fn details_expand_reasoning_and_bounded_tool_previews() {
+    fn list_continuations_keep_their_indent_and_link_targets() {
         let mut state = State::default();
-        state.messages.push(Message {
-            kind: "assistant".into(),
-            content: vec![
-                part(serde_json::json!({"type":"reasoning", "text":"Inspect the failing connection"})),
-                part(serde_json::json!({"type":"tool", "name":"read", "state":{
-                    "status":"completed", "input":{"path":"src/main.rs"},
-                    "content":[{"type":"text","text":"output line\n".repeat(1000)}]
-                }})),
-            ], ..Message::default()
-        });
-        let loader = loader();
-        let mut view = view(&state, &loader);
-        let compact = view
-            .transcript(50)
+        state.messages.push(assistant(vec![serde_json::json!({"type":"text","text":
+            "- Read [the implementation and its tests](src/main.rs:3) before changing it.\n\nA soft\nbreak stays in its paragraph."
+        })]));
+        let (loader, palette) = (loader(), palette());
+        let rows = view(&state, &loader, &palette).transcript(26);
+        let list_start = rows
             .iter()
-            .map(row_text)
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(compact.contains("▸ Read 1 file"));
+            .position(|row| row_text(row).starts_with("• "))
+            .unwrap();
+        let continuation = row_text(&rows[list_start + 1]);
+        assert!(continuation.starts_with("  "), "{continuation:?}");
+        assert!(rows
+            .iter()
+            .flat_map(|row| &row.links)
+            .any(|(_, reference)| reference.target.label() == "src/main.rs:3"));
+        assert!(rows
+            .iter()
+            .all(|row| row.spans.width() + row.indent as usize <= 26));
+        let wide = view(&state, &loader, &palette).transcript(100);
+        assert!(wide
+            .iter()
+            .any(|row| row_text(row).contains("A soft break stays")));
+    }
+
+    #[test]
+    fn chat_theme_overrides_do_not_restyle_other_markdown() {
+        let theme = Theme::from(
+            toml::from_str::<toml::Value>(
+                r##"
+            "ui.text" = "#eeeeee"
+            "keyword" = "#aa00aa"
+            "markup.heading" = "#bb00bb"
+            "ui.opencode.heading" = "#00bb00"
+            "ui.opencode.accent" = "#00aaaa"
+        "##,
+            )
+            .unwrap(),
+        );
+        let markdown = super::super::markdown::Markdown::new("## Title".into(), loader());
+        assert_eq!(
+            markdown.parse(Some(&theme)).lines[0].0[0].style.fg,
+            theme.get("markup.heading").fg
+        );
+        let chat = markdown.for_chat();
+        assert_eq!(
+            chat.parse(Some(&theme)).lines[0].0[0].style.fg,
+            theme.get("ui.opencode.heading").fg
+        );
+        assert_eq!(
+            chat_style(&theme, "accent", "keyword").fg,
+            theme.get("ui.opencode.accent").fg
+        );
+    }
+
+    #[test]
+    fn layout_stacks_transcript_jump_row_prompt_and_footer() {
+        let layout = ChatLayout::new(Rect::new(0, 0, 47, 30), 1, 0, 0);
+        assert_eq!(layout.body.width, 45);
+        assert_eq!(layout.body.bottom(), layout.jump.y);
+        assert_eq!(layout.jump.bottom(), layout.composer.y);
+        assert_eq!(layout.composer.bottom(), layout.footer.y);
+        assert_eq!(
+            layout.composer.height, 5,
+            "padding, input, padding, metadata, edge"
+        );
+        assert_eq!(layout.input.y, layout.composer.y + 1);
+        assert_eq!(layout.meta.y, layout.composer.y + 3);
+        assert_eq!(layout.edge.y, layout.composer.bottom() - 1);
+        let docked = ChatLayout::new(Rect::new(0, 0, 47, 30), 2, 1, 6);
+        assert_eq!(docked.dock.height, 6);
+        assert_eq!(docked.dock.bottom() + 1, docked.composer.y);
+        assert_eq!(docked.input.height, 2);
+        assert_eq!(docked.chips.y, docked.composer.y + 1);
+    }
+
+    #[test]
+    fn activity_collapses_into_a_summary_and_expands_into_tool_rows() {
+        let mut state = State::default();
+        let mut message = assistant(vec![
+            serde_json::json!({"type":"reasoning", "text":"**Inspect**\n\nCheck the failing connection"}),
+            serde_json::json!({"type":"tool", "name":"read", "state":{
+                "status":"completed", "input":{"path":"src/main.rs","offset":10,"limit":5},
+                "content":[{"type":"text","text":"output line\n".repeat(1000)}]
+            }}),
+            serde_json::json!({"type":"tool", "name":"opencode.read", "state":{"status":"completed","input":{"path":"two.rs"}}}),
+            serde_json::json!({"type":"tool", "name":"bash", "state":{
+                "status":"completed", "input":{"command":"cargo test"},
+                "content":[{"type":"text","text":(1..=30).map(|n| format!("line {n}")).collect::<Vec<_>>().join("\n")}]
+            }}),
+            serde_json::json!({"type":"tool", "name":"grep", "state":{
+                "status":"completed", "input":{"pattern":"fn main"}, "metadata":{"matches":3}
+            }}),
+            serde_json::json!({"type":"text","text":"Done."}),
+        ]);
+        message.time.completed = Some(1);
+        state.messages.push(message);
+        let (loader, palette) = (loader(), palette());
+        let mut view = view(&state, &loader, &palette);
+        let compact = text(&view.transcript(60));
+        assert!(
+            compact.contains("+ 1 command, 1 thought, 2 reads, 1 tool"),
+            "{compact}"
+        );
         assert!(!compact.contains("src/main.rs"));
-        assert!(!compact.contains("Inspect the failing"));
         assert!(!compact.contains("output line"));
+        assert!(compact.contains("Done."));
         view.expanded = true;
-        let rows = view.transcript(50);
-        let expanded = rows.iter().map(row_text).collect::<Vec<_>>().join("\n");
-        assert!(expanded.contains("Inspect the failing"));
-        assert!(expanded.contains("✓ read  src/main.rs"));
-        assert!(expanded.contains("output line"));
-        assert!(expanded.contains("preview truncated"));
-        assert!(rows.len() < 30);
+        let rows = view.transcript(60);
+        let expanded = text(&rows);
+        assert!(expanded.contains("− 1 command"));
+        assert!(expanded.contains("Thought: Inspect"));
+        assert!(expanded.contains("Check the failing connection"));
+        assert!(expanded.contains("→ Read src/main.rs:10-14"));
+        assert!(expanded.contains("→ Read two.rs"));
+        assert!(expanded.contains("$ cargo test"));
+        assert!(expanded.contains("earlier lines"));
+        assert!(expanded.contains("line 30"));
+        assert!(!expanded.contains("line 1\n"));
+        assert!(expanded.contains("✱ Grep \"fn main\" (3 matches)"));
+        assert!(
+            !expanded.contains("output line"),
+            "Read output stays hidden"
+        );
+        assert!(rows.len() < 60);
+        assert!(rows
+            .iter()
+            .flat_map(|row| &row.links)
+            .any(|(_, reference)| reference.target.label() == "src/main.rs"));
+    }
+
+    #[test]
+    fn running_work_shows_its_status_and_completed_steps_show_a_footer() {
+        let mut state = State::default();
+        state.busy = true;
+        state.messages.push(Message {
+            id: "msg_prompt".into(),
+            kind: "user".into(),
+            text: "Fix it".into(),
+            time: opencode::Times {
+                created: Some(1_000),
+                ..Default::default()
+            },
+            ..Message::default()
+        });
+        let mut step = assistant(vec![serde_json::json!({"type":"text","text":"Fixed."})]);
+        step.id = "msg_step".into();
+        step.agent = Some("build".into());
+        step.model = Some(opencode::ModelRef {
+            provider: "anthropic".into(),
+            model: "claude".into(),
+            variant: None,
+        });
+        step.finish = Some("stop".into());
+        step.time.completed = Some(13_400);
+        state.messages.push(step);
+        let mut running = assistant(vec![
+            serde_json::json!({"type":"tool","name":"bash","state":{
+                "status":"running","input":{"command":"cargo build"}
+            }}),
+        ]);
+        running.id = "msg_running".into();
+        running.finish = Some("tool-calls".into());
+        state.messages.push(running);
+        let (loader, palette) = (loader(), palette());
+        let rows = view(&state, &loader, &palette).transcript(80);
+        let output = text(&rows);
+        assert!(
+            output.contains("Build · anthropic/claude · 12.4s"),
+            "{output}"
+        );
+        assert!(output.contains("Running command…"));
+        assert_eq!(
+            output.matches("Build ·").count(),
+            1,
+            "Tool-call steps have no footer"
+        );
+    }
+
+    #[test]
+    fn edit_tools_render_a_numbered_diff_block() {
+        let mut state = State::default();
+        state.messages.push(assistant(vec![serde_json::json!({"type":"tool","name":"edit","state":{
+            "status":"completed","input":{"path":"/work/helix/src/lib.rs"},
+            "content":[{"type":"text","text":"ok"}],
+            "metadata":{"files":[{"type":"update","relativePath":"src/lib.rs","filePath":"/work/helix/src/lib.rs",
+                "patch":"--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -8,3 +8,3 @@\n context\n-old line\n+new line\n","additions":1,"deletions":1}]}
+        }})]));
+        let (loader, palette) = (loader(), palette());
+        let mut view = view(&state, &loader, &palette);
+        view.expanded = true;
+        let rows = view.transcript(60);
+        let output = text(&rows);
+        assert!(output.contains("← Edit src/lib.rs"), "{output}");
+        assert!(output.contains(" 8   context"));
+        assert!(output.contains(" 9 - old line"));
+        assert!(output.contains(" 9 + new line"));
+        assert!(!output.contains("+++"));
+        let added = rows
+            .iter()
+            .find(|row| row_text(row).contains("new line"))
+            .unwrap();
+        assert_eq!(
+            added.fill.map(|(column, _)| column),
+            Some(transcript::INDENT)
+        );
+        assert!(added
+            .spans
+            .0
+            .iter()
+            .any(|span| span.style.fg == palette.diff_plus.fg));
     }
 
     #[test]
@@ -1462,13 +1543,8 @@ mod tests {
                 "comment":"Why this branch?","preview":"if branch {","origin":"file"
             }],"attachments":[]}
         })).unwrap());
-        let loader = loader();
-        let output = view(&state, &loader)
-            .transcript(160)
-            .iter()
-            .map(row_text)
-            .collect::<Vec<_>>()
-            .join("\n");
+        let (loader, palette) = (loader(), palette());
+        let output = text(&view(&state, &loader, &palette).transcript(160));
         assert!(output.contains("Overall message"));
         assert!(output.contains("↳ /work/source.rs:4: Why this branch?"));
         assert!(
@@ -1481,17 +1557,15 @@ mod tests {
     #[test]
     fn markdown_file_links_are_inline_independent_and_survive_unicode_wrapping() {
         let mut state = State::default();
-        state.messages.push(Message {
-            id: "msg_links".into(), kind: "assistant".into(),
-            content: vec![part(serde_json::json!({"type":"text","text":
-                "See [**é界 implementation**](src/first.rs#L12C3) and [other](src/second.rs:8).\n\n`src/third.rs:4` and src/fourth.rs:9."
-            }))], ..Message::default()
-        });
-        let loader = loader();
-        for width in [8, 20, 200] {
-            let rows = view(&state, &loader).transcript(width);
-            let rendered = rows.iter().map(row_text).collect::<Vec<_>>().join("\n");
-            assert!(!rendered.contains("↳"));
+        let mut message = assistant(vec![serde_json::json!({"type":"text","text":
+            "See [**é界 implementation**](src/first.rs#L12C3) and [other](src/second.rs:8).\n\n`src/third.rs:4` and src/fourth.rs:9."
+        })]);
+        message.id = "msg_links".into();
+        state.messages.push(message);
+        let (loader, palette) = (loader(), palette());
+        for width in [12, 24, 200] {
+            let rows = view(&state, &loader, &palette).transcript(width);
+            let rendered = text(&rows);
             assert!(!rendered.contains("](src/"));
             let links: Vec<_> = rows
                 .iter()
@@ -1520,104 +1594,62 @@ mod tests {
             assert!(links
                 .iter()
                 .any(|(text, target)| target == "src/first.rs:12:3" && text.contains('é')));
-            if width == 200 {
-                assert!(rows.iter().any(|row| {
-                    row.links
-                        .iter()
-                        .any(|(_, r)| r.target.path.to_str() == Some("src/first.rs"))
-                        && row
-                            .links
-                            .iter()
-                            .any(|(_, r)| r.target.path.to_str() == Some("src/second.rs"))
-                }));
-            }
         }
     }
 
     #[test]
     fn web_image_labels_and_code_blocks_are_not_local_links() {
         let mut state = State::default();
-        state.messages.push(Message {
-            kind: "assistant".into(),
-            content: vec![part(serde_json::json!({"type":"text","text":
-                "[src/web.rs](https://example.com) ![src/image.rs](image.png)\n\n```rust\nsrc/not-a-link.rs\n```\n\n[local](src/local.rs)"
-            }))], ..Message::default()
-        });
-        let loader = loader();
-        let rows = view(&state, &loader).transcript(100);
+        state.messages.push(assistant(vec![serde_json::json!({"type":"text","text":
+            "[src/web.rs](https://example.com) ![src/image.rs](image.png)\n\n```rust\nsrc/not-a-link.rs\n```\n\n[local](src/local.rs)"
+        })]));
+        let (loader, palette) = (loader(), palette());
+        let rows = view(&state, &loader, &palette).transcript(100);
         let links: Vec<_> = rows.iter().flat_map(|row| &row.links).collect();
         assert_eq!(links.len(), 1);
         assert_eq!(links[0].1.target.path.to_str(), Some("src/local.rs"));
     }
 
     #[test]
-    fn consecutive_completed_reads_collapse_but_running_and_failed_tools_stay_visible() {
-        let mut state = State::default();
-        state.messages.push(Message {
-            kind: "assistant".into(),
-            content: vec![
-                part(serde_json::json!({"type":"tool","name":"opencode.read","state":{"status":"completed","input":{"path":"one.rs"}}})),
-                part(serde_json::json!({"type":"tool","name":"read","state":{"status":"completed","input":{"path":"two.rs"}}})),
-                part(serde_json::json!({"type":"tool","name":"read","state":{"status":"running","input":{"path":"running.rs"}}})),
-                part(serde_json::json!({"type":"tool","name":"read","state":{"status":"error","input":{"path":"failed.rs"}}})),
-                part(serde_json::json!({"type":"text","text":"Done."})),
-            ], ..Message::default()
-        });
-        let loader = loader();
-        let mut view = view(&state, &loader);
-        let compact = view
-            .transcript(100)
-            .iter()
-            .map(row_text)
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(compact.contains("▸ Read 2 files"));
-        assert!(!compact.contains("one.rs"));
-        assert!(!compact.contains("two.rs"));
-        assert!(compact.contains("running.rs"));
-        assert!(compact.contains("failed.rs"));
-        assert_eq!(
-            references::for_message(&state.messages[0], std::path::Path::new("/work")).len(),
-            4
-        );
-        view.expanded = true;
-        let expanded = view
-            .transcript(100)
-            .iter()
-            .map(row_text)
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(!expanded.contains("▸ Read"));
-        assert!(expanded.contains("one.rs"));
-        assert!(expanded.contains("two.rs"));
+    fn chrome_ellipsizes_unicode_without_overwriting_neighbors() {
+        let area = Rect::new(2, 1, 6, 1);
+        let mut surface = Buffer::empty(Rect::new(0, 0, 10, 3));
+        surface.set_string(8, 1, "x", Style::default());
+        write(area, &mut surface, "é界 long title\u{1b}", Style::default());
+        assert_eq!(surface.get(7, 1).unwrap().symbol.as_str(), "…");
+        assert_eq!(surface.get(8, 1).unwrap().symbol.as_str(), "x");
     }
 
     #[test]
     fn empty_state_and_composer_are_persistent_and_show_drafts() {
         let mut state = State::default();
         state.connected = true;
-        let loader = loader();
-        let mut view = view(&state, &loader);
+        let (loader, palette) = (loader(), palette());
+        let mut view = view(&state, &loader, &palette);
         let area = Rect::new(0, 0, 64, 24);
-        let layout = ChatLayout::new(area);
+        let layout = view.layout(area);
         let mut surface = Buffer::empty(area);
         view.render(area, &mut surface, &layout, &[], 0, true);
         let output = screen(&surface);
-        assert!(output.contains("OpenCode"));
-        assert!(output.contains("● Ready"));
         assert!(output.contains("What would you like"));
-        assert!(output.contains("Ask OpenCode"));
+        assert!(output.contains("Ask anything…"));
+        assert!(output.contains("Default model"));
+        assert!(
+            output.contains("▀▀▀"),
+            "The prompt has a half-height lower edge"
+        );
+        assert!(output.contains("i write"));
+        assert!(!output.contains("Jump to latest"));
         view.draft = "Review the current changes";
-        view.render(area, &mut surface, &layout, &[], 0, true);
+        view.render(area, &mut surface, &layout, &[], 0, false);
         let output = screen(&surface);
-        assert!(output.contains("Message  ·  draft"));
         assert!(output.contains("Review the current changes"));
-        assert!(!output.contains("Ask OpenCode"));
+        assert!(!output.contains("Ask anything"));
+        assert!(output.contains("Jump to latest ↓"));
         view.editing = true;
         view.render(area, &mut surface, &layout, &[], 0, true);
         let output = screen(&surface);
-        assert!(output.contains("Message  ·  editing"));
-        assert!(output.contains("Enter send   Esc cancel"));
+        assert!(output.contains("enter send"));
         assert!(
             !output.contains("Review the current changes"),
             "The preview must not duplicate the live input overlay"
@@ -1632,11 +1664,44 @@ mod tests {
     }
 
     #[test]
+    fn pending_requests_dock_above_the_prompt() {
+        let mut state = State::default();
+        state.connected = true;
+        state.forms.insert(
+            "frm_1".into(),
+            serde_json::from_value(serde_json::json!({
+                "id":"frm_1","sessionID":"ses_test","title":"Pick a branch","fields":[]
+            }))
+            .unwrap(),
+        );
+        let (loader, palette) = (loader(), palette());
+        let view = view(&state, &loader, &palette);
+        let area = Rect::new(0, 0, 64, 24);
+        let layout = view.layout(area);
+        assert!(layout.dock.height > 0);
+        let mut surface = Buffer::empty(area);
+        view.render(area, &mut surface, &layout, &[], 0, true);
+        let output = screen(&surface);
+        assert!(output.contains("△ Question"));
+        assert!(output.contains("? Pick a branch"));
+        assert!(output.contains("p respond"));
+    }
+
+    #[test]
     fn small_and_offset_panes_never_draw_outside_their_area() {
         let mut state = State::default();
         state.error = Some("Network unavailable".into());
-        let loader = loader();
-        let view = view(&state, &loader);
+        state.busy = true;
+        state.connected = true;
+        state.messages.push(Message {
+            id: "msg_user".into(),
+            kind: "user".into(),
+            text: "A long user request that wraps".into(),
+            ..Message::default()
+        });
+        let (loader, palette) = (loader(), palette());
+        let mut view = view(&state, &loader, &palette);
+        view.draft = "draft\nwith lines";
         for width in [0, 1, 2, 5, 8, 20, 64] {
             for height in [0, 1, 2, 4, 8, 12, 24] {
                 let area = Rect::new(2, 2, width, height);
@@ -1645,9 +1710,24 @@ mod tests {
                 for y in 0..outer.height {
                     surface.set_string(0, y, &"x".repeat(outer.width as usize), Style::default());
                 }
-                let layout = ChatLayout::new(area);
-                let rows = view.transcript(layout.body.width.saturating_sub(3) as usize);
-                view.render(area, &mut surface, &layout, &rows, 0, true);
+                let layout = view.layout(area);
+                for rect in [
+                    layout.body,
+                    layout.jump,
+                    layout.dock,
+                    layout.composer,
+                    layout.input,
+                    layout.meta,
+                    layout.edge,
+                    layout.footer,
+                ] {
+                    assert!(
+                        rect.height == 0 || (rect.y >= area.y && rect.bottom() <= area.bottom()),
+                        "{rect:?} outside {area:?}"
+                    );
+                }
+                let rows = view.transcript(layout.body.width as usize);
+                view.render(area, &mut surface, &layout, &rows, 0, false);
                 for y in 0..outer.height {
                     for x in 0..outer.width {
                         if x < area.x || x >= area.right() || y < area.y || y >= area.bottom() {
@@ -1760,6 +1840,8 @@ mod tests {
             "Repeated staging deduplicates identical snapshots"
         );
         assert_eq!(pane.draft.lock().as_str(), "Review this");
+        assert!(!pane.needs_session_confirmation(&pane.session_id));
+        assert!(pane.needs_session_confirmation("ses_other"));
         if let PaneOutcome::Compose { draft, .. } = pane.command(PaneCommand::Compose, 1)? {
             *draft.lock() = "cancelled draft".into();
         } else {
@@ -1798,6 +1880,22 @@ mod tests {
         pane.stage_snippets(vec![replacement], "")?;
         assert_eq!(pane.snippets.len(), 1);
         assert_eq!(pane.snippets[0].comment, "Different comment");
+        let session = pane.session_id.clone();
+        let connection = pane.connection.state.clone();
+        pane.offset = 17;
+        pane.follow = false;
+        pane.expanded = true;
+        pane.input.lock().area = Rect::new(2, 20, 40, 1);
+        assert!(pane.retain_on_close());
+        pane.on_hide();
+        assert_eq!(pane.session_id, session);
+        assert!(Arc::ptr_eq(&connection, &pane.connection.state));
+        assert_eq!(pane.draft.lock().as_str(), "cancelled draft");
+        assert_eq!(pane.snippets[0].comment, "Different comment");
+        assert_eq!(pane.offset, 17);
+        assert!(!pane.follow);
+        assert!(pane.expanded);
+        assert_eq!(pane.input.lock().area, Rect::default());
         pane.submit("hello".into())?;
         assert_eq!(pane.connection.state.lock().pending[0].text, "hello");
         assert_eq!(pane.connection.state.lock().pending[0].snippets.len(), 1);

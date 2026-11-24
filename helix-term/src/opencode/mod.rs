@@ -1,9 +1,11 @@
 //! Native OpenCode V2 session client and transcript state.
+pub(crate) mod changes;
 mod client;
 pub(crate) mod interactions;
 #[cfg(test)]
 mod live_tests;
 pub(crate) mod models;
+pub(crate) mod sessions;
 pub(crate) mod snippets;
 #[cfg(test)]
 mod tests;
@@ -60,6 +62,7 @@ impl ModelRef {
 
 #[derive(Clone, Debug, Default, Deserialize)]
 pub(crate) struct Times {
+    pub created: Option<u64>,
     pub busy: Option<u64>,
     pub idle: Option<u64>,
     pub completed: Option<u64>,
@@ -87,6 +90,7 @@ pub(crate) struct ToolState {
     #[serde(default)]
     pub content: Vec<Value>,
     pub error: Option<Value>,
+    pub metadata: Option<Value>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -102,6 +106,38 @@ pub(crate) struct Part {
     pub state: Option<ToolState>,
     #[serde(skip)]
     complete: bool,
+}
+
+impl Part {
+    pub fn is_complete(&self) -> bool {
+        self.complete
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
+pub(crate) struct CacheUsage {
+    #[serde(default)]
+    pub read: f64,
+    #[serde(default)]
+    pub write: f64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
+pub(crate) struct TokenUsage {
+    #[serde(default)]
+    pub input: f64,
+    #[serde(default)]
+    pub output: f64,
+    #[serde(default)]
+    pub reasoning: f64,
+    #[serde(default)]
+    pub cache: CacheUsage,
+}
+
+impl TokenUsage {
+    pub fn total(&self) -> f64 {
+        self.input + self.output + self.reasoning + self.cache.read + self.cache.write
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -121,6 +157,22 @@ pub(crate) struct Message {
     #[serde(default)]
     pub files: Vec<Value>,
     pub metadata: Option<Value>,
+    pub location: Option<Location>,
+    pub previous: Option<Value>,
+    pub finish: Option<String>,
+    pub cost: Option<f64>,
+    pub tokens: Option<TokenUsage>,
+    /// Skill name.
+    pub name: Option<String>,
+    /// Short summary of system and synthetic notices.
+    pub description: Option<String>,
+    /// Compaction state and summary.
+    pub status: Option<String>,
+    pub summary: Option<String>,
+    /// Shell message command and output page.
+    pub command: Option<String>,
+    pub output: Option<Value>,
+    pub exit: Option<i64>,
 }
 
 #[derive(Clone, Debug)]
@@ -251,6 +303,8 @@ impl State {
         if !matches!(
             event.kind.as_str(),
             "session.step.started"
+                | "session.step.ended"
+                | "session.step.failed"
                 | "session.execution.started"
                 | "session.execution.succeeded"
                 | "session.execution.interrupted"
@@ -263,6 +317,7 @@ impl State {
                 | "session.reasoning.ended"
                 | "session.tool.input.started"
                 | "session.tool.called"
+                | "session.tool.progress"
                 | "session.tool.success"
                 | "session.tool.failed"
                 | "permission.asked"
@@ -284,6 +339,46 @@ impl State {
                 );
                 message.agent = data.agent;
                 message.model = data.model;
+                message.finish = None;
+                if data.started.is_some() {
+                    message.time.created = data.started;
+                }
+            }
+            "session.step.ended" | "session.step.failed" => {
+                let failed = event.kind == "session.step.failed";
+                let message = self.assistant(
+                    data.assistant_message_id
+                        .as_deref()
+                        .context("Missing assistant message ID")?,
+                );
+                // Step events carry no timestamp; the next snapshot replaces this.
+                message.time.completed = Some(now_millis());
+                message.finish = data.finish.or_else(|| failed.then(|| "error".to_owned()));
+                if data.cost.is_some() {
+                    message.cost = data.cost;
+                }
+                if data.tokens.is_some() {
+                    message.tokens = data.tokens;
+                }
+                if data.error.is_some() {
+                    message.error = data.error;
+                }
+            }
+            "session.tool.progress" => {
+                let message = self.assistant(
+                    data.assistant_message_id
+                        .as_deref()
+                        .context("Missing assistant message ID")?,
+                );
+                let id = data.id.context("Missing tool ID")?;
+                if let Some(tool) = message
+                    .content
+                    .iter_mut()
+                    .find(|part| part.kind == "tool" && part.id == id)
+                    .and_then(|part| part.state.as_mut())
+                {
+                    tool.metadata = data.metadata;
+                }
             }
             "session.execution.started" => {
                 self.busy = true;
@@ -391,6 +486,9 @@ impl State {
                 if let Some(error) = data.error {
                     tool.error = Some(error);
                 }
+                if let Some(metadata) = data.metadata {
+                    tool.metadata = Some(metadata);
+                }
             }
             "permission.replied" => {
                 self.permissions
@@ -424,6 +522,19 @@ struct EventData {
     error: Option<Value>,
     input: Option<Value>,
     content: Option<Vec<Value>>,
+    metadata: Option<Value>,
+    finish: Option<String>,
+    cost: Option<f64>,
+    tokens: Option<TokenUsage>,
+    started: Option<u64>,
+}
+
+pub(crate) const SPINNER_INTERVAL_MS: u64 = 80;
+
+pub(crate) fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |time| time.as_millis() as u64)
 }
 
 pub(crate) fn error_summary(error: Option<&Value>) -> String {
@@ -439,6 +550,10 @@ pub(crate) fn error_summary(error: Option<&Value>) -> String {
 }
 
 enum Request {
+    TurnChanges {
+        from: String,
+        reply: tokio::sync::oneshot::Sender<Result<Vec<interactions::FileChange>>>,
+    },
     Models(tokio::sync::oneshot::Sender<Result<Vec<models::Model>>>),
     SwitchModel {
         model: ModelRef,
@@ -672,11 +787,22 @@ async fn run_with_api(
     state.lock().connected = true;
     helix_event::request_redraw();
     let mut decoder = EventDecoder::default();
+    // Animates running indicators without redrawing an idle editor.
+    let mut ticker = tokio::time::interval(Duration::from_millis(SPINNER_INTERVAL_MS));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // A deadline, not a per-poll timeout, so ticks and requests cannot postpone it.
+    const EVENT_TIMEOUT: Duration = Duration::from_secs(90);
+    let mut deadline = tokio::time::Instant::now() + EVENT_TIMEOUT;
     loop {
+        let busy = state.lock().busy;
         tokio::select! {
+            _ = ticker.tick(), if busy => helix_event::request_redraw(),
             request = requests.recv() => {
                 let Some(request) = request else { return Ok(()); };
                 match request {
+                    Request::TurnChanges { from, reply } => {
+                        if !reply.is_closed() { let _ = reply.send(api.turn_changes(id, Some(&from), None).await); }
+                    }
                     Request::Models(reply) => {
                         let directory = state.lock().session.as_ref().map(|session| session.location.directory.clone());
                         let result = match directory {
@@ -735,9 +861,10 @@ async fn run_with_api(
                 }
                 helix_event::request_redraw();
             }
-            chunk = tokio::time::timeout(Duration::from_secs(90), events.chunk()) => {
+            chunk = tokio::time::timeout_at(deadline, events.chunk()) => {
                 let chunk = chunk.context("OpenCode event stream timed out")?
                     .context("OpenCode event stream failed")?.context("OpenCode event stream closed")?;
+                deadline = tokio::time::Instant::now() + EVENT_TIMEOUT;
                 for event in decoder.push(&chunk)? {
                     let event_session = event.data.get("sessionID").or_else(|| event.data.get("form").and_then(|form| form.get("sessionID"))).and_then(Value::as_str);
                     if event_session != Some(id) { continue; }

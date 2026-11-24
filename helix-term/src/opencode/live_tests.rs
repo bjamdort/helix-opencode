@@ -5,6 +5,144 @@ use reqwest::Method;
 use serde_json::json;
 
 #[tokio::test]
+#[ignore = "lists and attaches an isolated existing V2 session; no model inference"]
+async fn live_service_session_picker_listing_and_attach() -> Result<()> {
+    let api = Api::connect(Endpoint::discover().await?).await?;
+    let directory = tempfile::Builder::new()
+        .prefix("helix-session-picker-")
+        .tempdir_in("/tmp/opencode")?;
+    let id = new_id("ses");
+    api.create(&id, directory.path()).await?;
+    let result: Result<()> = async {
+        let browser = sessions::SessionBrowser::connect().await?;
+        let mut listed = None;
+        browser
+            .stream(
+                |session| {
+                    if session.id == id {
+                        listed = Some(session);
+                        false
+                    } else {
+                        true
+                    }
+                },
+                || false,
+            )
+            .await?;
+        anyhow::ensure!(
+            listed.is_some(),
+            "Session picker did not list the fixture session"
+        );
+        let selected = browser.session(&id).await?;
+        anyhow::ensure!(
+            selected.location.directory == directory.path(),
+            "Picker did not retain the selected session directory"
+        );
+        let connection = Connection::new(selected.location.directory, Some(selected.id));
+        wait_for(&connection, |state| state.connected).await?;
+        anyhow::ensure!(
+            connection
+                .state
+                .lock()
+                .session
+                .as_ref()
+                .is_some_and(|session| session.id == id),
+            "Picker did not attach the selected existing session"
+        );
+        anyhow::ensure!(
+            api.messages(&id).await?.is_empty(),
+            "Browsing or attaching unexpectedly sent a prompt"
+        );
+        Ok(())
+    }
+    .await;
+    let removed = api.remove_test_session(&id).await;
+    result?;
+    removed?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "uses explicit model inference for two scoped fixture edits and verifies historical turn snapshots"]
+async fn live_service_historical_turn_changes() -> Result<()> {
+    use interactions::PermissionDecision;
+    let api = Api::connect(Endpoint::discover().await?).await?;
+    let directory = tempfile::Builder::new()
+        .prefix("helix-turn-review-")
+        .tempdir_in("/tmp/opencode")?;
+    let marker = directory.path().join("marker.txt");
+    std::fs::write(&marker, "BASE\n")?;
+    for args in [
+        vec!["init", "--quiet"],
+        vec!["add", "marker.txt"],
+        vec!["commit", "--quiet", "-m", "initial"],
+    ] {
+        let output = std::process::Command::new("git")
+            .current_dir(directory.path())
+            .args([
+                "-c",
+                "user.name=Helix test",
+                "-c",
+                "user.email=test@example.invalid",
+                "-c",
+                "core.hooksPath=",
+                "-c",
+                "commit.gpgSign=false",
+            ])
+            .args(args)
+            .output()?;
+        anyhow::ensure!(
+            output.status.success(),
+            "Cannot prepare the isolated turn-review repository"
+        );
+    }
+    let id = fixture_with_rules(
+        &api,
+        directory.path(),
+        json!([
+            {"action":"*","resource":"*","effect":"deny"},
+            {"action":"edit","resource":"marker.txt","effect":"ask"},
+            {"action":"read","resource":"marker.txt","effect":"allow"}
+        ]),
+    )
+    .await?;
+    let result: Result<()> = async {
+        let mut connection = Connection::new(directory.path().to_owned(), Some(id.clone()));
+        wait_for(&connection, |state| state.connected).await?;
+        let mut anchors = Vec::new();
+        for (contents, token) in [("TURN_ONE","HELIX_TURN_ONE_DONE"),("TURN_TWO","HELIX_TURN_TWO_DONE")] {
+            connection.send(format!("Isolated integration test: use write or edit to make marker.txt contain exactly {contents} followed by one newline. Do not modify any other file or use shell. Then reply exactly {token}."))?;
+            anchors.push(connection.state.lock().pending.last().context("Missing local prompt")?.id.clone());
+            wait_for(&connection, |state| !state.permissions.is_empty() || !state.busy && has_reply(state,token)).await?;
+            let permission = connection.state.lock().permissions.values().next().cloned().context("Agent did not request fixture edit approval")?;
+            anyhow::ensure!(permission.action == "edit" && permission.resources == ["marker.txt"],
+                "Refusing an approval outside the fixture file");
+            connection.interactions().permission(permission, PermissionDecision::Once)?;
+            wait_for(&connection, |state| !state.busy && has_reply(state,token)).await?;
+            anyhow::ensure!(std::fs::read_to_string(&marker)? == format!("{contents}\n"), "Unexpected fixture edit");
+        }
+        let handle = connection.changes_handle()?;
+        let first = handle.diff(anchors[0].clone())?.await??;
+        let second = handle.diff(anchors[1].clone())?.await??;
+        let first = first.iter().find(|file| file.file == "marker.txt").context("First turn has no marker diff")?;
+        let second = second.iter().find(|file| file.file == "marker.txt").context("Second turn has no marker diff")?;
+        anyhow::ensure!(first.patch.contains("-BASE") && first.patch.contains("+TURN_ONE") && !first.patch.contains("TURN_TWO"),
+            "Earlier turn did not retain its own snapshot after the second edit");
+        anyhow::ensure!(second.patch.contains("-TURN_ONE") && second.patch.contains("+TURN_TWO"),
+            "Second turn did not compare its own start and end snapshots");
+        let turns = handle.turns();
+        anyhow::ensure!(turns.len() == 2 && turns[0].id == anchors[1] && turns[1].id == anchors[0], "Turn picker did not follow idle boundaries");
+        Ok(())
+    }.await;
+    let interrupted = api.interrupt(&id).await;
+    let removed = api.remove_test_session(&id).await;
+    result?;
+    interrupted?;
+    removed?;
+    Ok(())
+}
+
+#[tokio::test]
 #[ignore = "stages a snippet in an isolated V2 session with resume=false; no model inference"]
 async fn live_service_selected_snippet_admission() -> Result<()> {
     let api = Api::connect(Endpoint::discover().await?).await?;

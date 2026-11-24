@@ -422,6 +422,8 @@ impl MappableCommand {
         toggle_file_explorer, "Toggle the file explorer sidebar",
         opencode_chat, "Toggle the OpenCode chat pane",
         pane_activate, "Activate the selected pane item",
+        pane_open_horizontal_split, "Open the selected pane file in a split below",
+        pane_open_vertical_split, "Open the selected pane file in a split to the right",
         pane_compose, "Compose a message in the focused pane",
         pane_interrupt, "Interrupt the focused pane's operation",
         pane_new, "Start a new conversation in the focused pane",
@@ -551,6 +553,7 @@ impl MappableCommand {
         completion, "Invoke completion popup",
         hover, "Show docs for item under cursor",
         toggle_comments, "Comment/uncomment selections",
+        toggle_inline_diff, "Show or hide changes against the diff base inside the buffer",
         toggle_line_comments, "Line comment/uncomment selections",
         toggle_block_comments, "Block comment/uncomment selections",
         rotate_selections_forward, "Rotate selections forward",
@@ -757,6 +760,14 @@ fn no_op(_cx: &mut Context) {}
 
 fn pane_activate(cx: &mut Context) {
     cx.editor.set_error("No auxiliary pane is focused");
+}
+
+fn pane_open_horizontal_split(cx: &mut Context) {
+    cx.editor.set_error("No file explorer pane is focused");
+}
+
+fn pane_open_vertical_split(cx: &mut Context) {
+    cx.editor.set_error("No file explorer pane is focused");
 }
 
 fn pane_refresh(cx: &mut Context) {
@@ -5708,6 +5719,29 @@ fn toggle_comments_impl(cx: &mut Context, comment_transaction: CommentTransactio
 /// 3. whole selection block commented -> uncomment selection
 /// 4. all lines not commented and block tokens -> comment uncommented lines
 /// 5. no comment tokens and not block commented -> line comment
+fn toggle_inline_diff(cx: &mut Context) {
+    toggle_inline_diff_impl(cx.editor);
+}
+
+/// Show changes against the current buffer's diff base inline, or hide them.
+pub(crate) fn toggle_inline_diff_impl(editor: &mut Editor) {
+    let doc = doc_mut!(editor);
+    if !doc.inline_diff && doc.diff_handle().is_none() {
+        editor.set_error("This buffer has no diff base: it is not tracked by Git");
+        return;
+    }
+    doc.inline_diff = !doc.inline_diff;
+    let message = if doc.inline_diff {
+        format!(
+            "Showing changes against {}",
+            doc.diff_source().unwrap_or("HEAD")
+        )
+    } else {
+        "Inline changes hidden".to_owned()
+    };
+    editor.set_status(message);
+}
+
 fn toggle_comments(cx: &mut Context) {
     toggle_comments_impl(cx, |line_token, block_tokens, doc, selection| {
         let text = doc.slice(..);

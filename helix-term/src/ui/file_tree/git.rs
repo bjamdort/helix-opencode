@@ -11,7 +11,7 @@ use tokio::process::Command;
 
 /// Ordered by display priority when a directory contains multiple kinds of change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub(super) enum Status {
+pub(crate) enum Status {
     Ignored,
     Untracked,
     Added,
@@ -60,9 +60,17 @@ impl Status {
 }
 
 #[derive(Debug, Default)]
-pub(super) struct Snapshot {
+pub(crate) struct Snapshot {
     // Paths are relative to the sidebar root, not the repository root.
     paths: HashMap<PathBuf, Status>,
+    pub files: Vec<ChangedFile>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ChangedFile {
+    pub path: PathBuf,
+    pub original: Option<PathBuf>,
+    pub status: Status,
 }
 
 impl Snapshot {
@@ -106,6 +114,7 @@ impl Snapshot {
             }
             let xy = &record[..2];
             let path = path_from_bytes(&record[3..])?;
+            let mut original = None;
             if let Some(status) = Status::from_xy(xy) {
                 if let Ok(relative) = path.strip_prefix(prefix) {
                     snapshot.insert(relative.to_owned(), status);
@@ -120,11 +129,21 @@ impl Snapshot {
                 if xy.contains(&b'R') {
                     let source = path_from_bytes(source)?;
                     if let Ok(relative) = source.strip_prefix(prefix) {
+                        original = Some(relative.to_owned());
                         // The old filename no longer exists, but its parents still changed.
                         if let Some(parent) = relative.parent() {
                             snapshot.insert(parent.to_owned(), Status::Renamed);
                         }
                     }
+                }
+            }
+            if let (Some(status), Ok(relative)) = (Status::from_xy(xy), path.strip_prefix(prefix)) {
+                if status != Status::Ignored {
+                    snapshot.files.push(ChangedFile {
+                        path: relative.to_owned(),
+                        original,
+                        status,
+                    });
                 }
             }
         }

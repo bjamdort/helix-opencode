@@ -503,6 +503,15 @@ impl View {
             }
         }
 
+        // Removed lines come before inline diagnostics; the decorations that
+        // draw both must be added in the same order.
+        if let Some(diff) = crate::annotations::diff::InlineDiff::for_document(doc) {
+            text_annotations.add_line_annotation(crate::annotations::diff::InlineDiffLines::new(
+                doc.text().slice(..),
+                diff,
+            ));
+        }
+
         let width = self.inner_width(doc);
         let enable_cursor_line = self
             .diagnostics_handler

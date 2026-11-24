@@ -1,4 +1,4 @@
-mod git;
+pub(super) mod git;
 
 use std::{
     collections::HashSet,
@@ -34,61 +34,64 @@ struct Entry {
 
 impl Entry {
     fn icon(&self, expanded: bool) -> &'static str {
-        if self.directory {
-            return if expanded { "\u{f07c}" } else { "\u{f07b}" };
-        }
+        icon(&self.path, self.directory, expanded)
+    }
+}
 
-        let name = self
-            .path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("");
-        // Specific filenames take precedence over their extensions.
-        match name {
-            "Cargo.toml" | "Cargo.lock" => return "\u{e7a8}",
-            "Dockerfile" | "Containerfile" | "docker-compose.yml" | "docker-compose.yaml" => {
-                return "\u{f308}"
-            }
-            "Makefile" | "GNUmakefile" | "justfile" | "Justfile" => return "\u{e615}",
-            "LICENSE" | "LICENSE.md" | "LICENSE.txt" | "COPYING" => return "\u{f48a}",
-            ".gitignore" | ".gitattributes" | ".gitmodules" => return "\u{e702}",
-            _ => (),
-        }
+/// A Nerd Font icon for a directory or file, shared with the changes list.
+pub(super) fn icon(path: &std::path::Path, directory: bool, expanded: bool) -> &'static str {
+    if directory {
+        return if expanded { "\u{f07c}" } else { "\u{f07b}" };
+    }
 
-        let extension = self
-            .path
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .unwrap_or("")
-            .to_ascii_lowercase();
-        match extension.as_str() {
-            "rs" => "\u{e7a8}",
-            "js" | "mjs" | "cjs" | "jsx" => "\u{e74e}",
-            "ts" | "mts" | "cts" | "tsx" => "\u{e628}",
-            "py" | "pyi" | "pyw" => "\u{e73c}",
-            "go" => "\u{e627}",
-            "c" | "h" => "\u{e61e}",
-            "cpp" | "cc" | "cxx" | "hpp" | "hh" | "hxx" => "\u{e61d}",
-            "java" | "class" | "jar" => "\u{e738}",
-            "rb" | "gemspec" => "\u{e739}",
-            "php" => "\u{e73d}",
-            "lua" => "\u{e620}",
-            "ex" | "exs" => "\u{e62d}",
-            "swift" => "\u{e755}",
-            "nix" => "\u{f313}",
-            "sh" | "bash" | "zsh" | "fish" => "\u{f489}",
-            "html" | "htm" => "\u{e736}",
-            "css" | "scss" | "sass" | "less" => "\u{e749}",
-            "json" | "jsonc" => "\u{e60b}",
-            "toml" | "yaml" | "yml" | "ini" | "conf" | "cfg" => "\u{e615}",
-            "md" | "mdx" | "markdown" => "\u{e73e}",
-            "txt" | "rst" | "adoc" => "\u{f15c}",
-            "png" | "jpg" | "jpeg" | "gif" | "svg" | "webp" | "ico" | "bmp" => "\u{f1c5}",
-            "zip" | "tar" | "gz" | "bz2" | "xz" | "7z" | "zst" => "\u{f1c6}",
-            "pdf" => "\u{f1c1}",
-            "ttf" | "otf" | "woff" | "woff2" => "\u{f031}",
-            _ => "\u{f15b}",
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    // Specific filenames take precedence over their extensions.
+    match name {
+        "Cargo.toml" | "Cargo.lock" => return "\u{e7a8}",
+        "Dockerfile" | "Containerfile" | "docker-compose.yml" | "docker-compose.yaml" => {
+            return "\u{f308}"
         }
+        "Makefile" | "GNUmakefile" | "justfile" | "Justfile" => return "\u{e615}",
+        "LICENSE" | "LICENSE.md" | "LICENSE.txt" | "COPYING" => return "\u{f48a}",
+        ".gitignore" | ".gitattributes" | ".gitmodules" => return "\u{e702}",
+        _ => (),
+    }
+
+    let extension = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match extension.as_str() {
+        "rs" => "\u{e7a8}",
+        "js" | "mjs" | "cjs" | "jsx" => "\u{e74e}",
+        "ts" | "mts" | "cts" | "tsx" => "\u{e628}",
+        "py" | "pyi" | "pyw" => "\u{e73c}",
+        "go" => "\u{e627}",
+        "c" | "h" => "\u{e61e}",
+        "cpp" | "cc" | "cxx" | "hpp" | "hh" | "hxx" => "\u{e61d}",
+        "java" | "class" | "jar" => "\u{e738}",
+        "rb" | "gemspec" => "\u{e739}",
+        "php" => "\u{e73d}",
+        "lua" => "\u{e620}",
+        "ex" | "exs" => "\u{e62d}",
+        "swift" => "\u{e755}",
+        "nix" => "\u{f313}",
+        "sh" | "bash" | "zsh" | "fish" => "\u{f489}",
+        "html" | "htm" => "\u{e736}",
+        "css" | "scss" | "sass" | "less" => "\u{e749}",
+        "json" | "jsonc" => "\u{e60b}",
+        "toml" | "yaml" | "yml" | "ini" | "conf" | "cfg" => "\u{e615}",
+        "md" | "mdx" | "markdown" => "\u{e73e}",
+        "txt" | "rst" | "adoc" => "\u{f15c}",
+        "png" | "jpg" | "jpeg" | "gif" | "svg" | "webp" | "ico" | "bmp" => "\u{f1c5}",
+        "zip" | "tar" | "gz" | "bz2" | "xz" | "7z" | "zst" => "\u{f1c6}",
+        "pdf" => "\u{f1c1}",
+        "ttf" | "otf" | "woff" | "woff2" => "\u{f031}",
+        _ => "\u{f15b}",
     }
 }
 
@@ -138,10 +141,10 @@ mod tests {
         let area = Rect::new(0, 0, 20, 5);
         let mut surface = Surface::empty(area);
         tree.render(area, &mut surface, theme, true);
-        assert_eq!(surface.get(18, 0).unwrap().symbol.as_str(), "M");
-        assert_eq!(surface.get(18, 1).unwrap().symbol.as_str(), "M");
-        assert_eq!(surface.get(18, 2).unwrap().symbol.as_str(), " ");
-        assert_eq!(surface.get(18, 3).unwrap().symbol.as_str(), "?");
+        assert_eq!(surface.get(19, 0).unwrap().symbol.as_str(), "M");
+        assert_eq!(surface.get(19, 1).unwrap().symbol.as_str(), "M");
+        assert_eq!(surface.get(19, 2).unwrap().symbol.as_str(), " ");
+        assert_eq!(surface.get(19, 3).unwrap().symbol.as_str(), "?");
         assert_eq!(
             surface.get(4, 1).unwrap().fg,
             theme.get("diff.delta").fg.unwrap()
@@ -154,7 +157,6 @@ mod tests {
             surface.get(4, 3).unwrap().fg,
             theme.get("diff.plus").fg.unwrap()
         );
-        assert_eq!(surface.get(19, 1).unwrap().symbol.as_str(), "│");
         // Tiny terminals must never place a status marker outside the sidebar.
         for width in 0..5 {
             let area = Rect::new(0, 0, width, 3);
@@ -264,6 +266,7 @@ pub(super) struct FileTree {
     git_pending: Option<Arc<()>>,
     git_last_refresh: Option<Instant>,
     git_refresh_requested: bool,
+    pub(super) changes: Option<super::changes::SharedReview>,
 }
 
 impl FileTree {
@@ -272,6 +275,8 @@ impl FileTree {
             root,
             keymap: keymap!({ "File explorer"
                 "ret" => pane_activate,
+                "\\" => pane_open_horizontal_split,
+                "|" => pane_open_vertical_split,
                 "r" => pane_refresh,
                 "q" => pane_close,
                 "esc" | "tab" => focus_document_pane,
@@ -287,6 +292,7 @@ impl FileTree {
             git_pending: None,
             git_last_refresh: None,
             git_refresh_requested: true,
+            changes: None,
         };
         tree.refresh()?;
         Ok(tree)
@@ -372,6 +378,10 @@ impl FileTree {
     }
 
     fn activate(&mut self) -> anyhow::Result<PaneOutcome> {
+        self.open_selected(Action::Replace)
+    }
+
+    fn open_selected(&mut self, action: Action) -> anyhow::Result<PaneOutcome> {
         if let Some(entry) = self.entries.get(self.selected) {
             if entry.directory {
                 if self.expanded.contains(&entry.path) {
@@ -380,7 +390,7 @@ impl FileTree {
                     self.expand()?;
                 }
             } else {
-                return Ok(PaneOutcome::OpenFile(entry.path.clone(), Action::Replace));
+                return Ok(PaneOutcome::OpenFile(entry.path.clone(), action));
             }
         }
         Ok(PaneOutcome::None)
@@ -457,6 +467,10 @@ impl FileTree {
 
     pub fn render(&mut self, area: Rect, surface: &mut Surface, theme: &Theme, focused: bool) {
         self.area = area;
+        if let Some(review) = &self.changes {
+            super::changes::render_list(review, area, surface, theme, focused);
+            return;
+        }
         if area.width < 2 || area.height == 0 {
             return;
         }
@@ -467,7 +481,7 @@ impl FileTree {
             self.offset = self.selected.saturating_sub(height.saturating_sub(1));
         }
         surface.set_style(area, theme.get("ui.background"));
-        let width = area.width - 1;
+        let width = area.width;
         let root_status = self.git_status.status(std::path::Path::new(""));
         let mut title_style = theme.get("ui.statusline");
         if let Some(color) = root_status.and_then(|status| theme.get(status.scope()).fg) {
@@ -527,9 +541,6 @@ impl FileTree {
                 }
             }
         }
-        for y in area.y..area.bottom() {
-            surface.set_string(area.right() - 1, y, "│", theme.get("ui.window"));
-        }
     }
 
     pub fn cursor(&self) -> (Option<Position>, CursorKind) {
@@ -563,6 +574,9 @@ impl Pane for FileTree {
     }
 
     fn command(&mut self, command: PaneCommand, count: usize) -> anyhow::Result<PaneOutcome> {
+        if let Some(review) = &self.changes {
+            return super::changes::list_command(review, command, count, self.area.height);
+        }
         let last = self.entries.len().saturating_sub(1);
         let page = (self.area.height.saturating_sub(1) as usize).saturating_mul(count);
         match command {
@@ -575,6 +589,8 @@ impl Pane for FileTree {
             PaneCommand::PageUp => self.selected = self.selected.saturating_sub(page),
             PaneCommand::PageDown => self.selected = self.selected.saturating_add(page).min(last),
             PaneCommand::Activate => return self.activate(),
+            PaneCommand::OpenHorizontalSplit => return self.open_selected(Action::HorizontalSplit),
+            PaneCommand::OpenVerticalSplit => return self.open_selected(Action::VerticalSplit),
             PaneCommand::Refresh => self.refresh()?,
             PaneCommand::Close => return Ok(PaneOutcome::Close),
             PaneCommand::FocusDocument => return Ok(PaneOutcome::FocusDocument),
@@ -597,6 +613,10 @@ impl Pane for FileTree {
     }
 
     fn mouse(&mut self, mouse: &helix_view::input::MouseEvent, area: Rect) {
+        if let Some(review) = &self.changes {
+            super::changes::list_mouse(review, mouse, area);
+            return;
+        }
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) if mouse.row > area.y => {
                 let row = (mouse.row - area.y - 1) as usize;
@@ -611,10 +631,16 @@ impl Pane for FileTree {
     }
 
     fn update(&mut self, id: PaneId, editor: &Editor, jobs: &mut Jobs) {
+        if let Some(review) = &self.changes {
+            super::changes::update(review, editor, jobs);
+            return;
+        }
         self.update_git_status(id, editor, jobs);
     }
     fn refresh(&mut self) {
-        self.request_git_refresh();
+        if self.changes.is_none() {
+            self.request_git_refresh();
+        }
     }
     fn render(&mut self, area: Rect, surface: &mut Surface, editor: &Editor, focused: bool) {
         self.render(area, surface, &editor.theme, focused);

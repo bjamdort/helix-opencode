@@ -292,6 +292,52 @@ where
     Ok(chars)
 }
 
+/// Edge of the containing pane group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PanePosition {
+    Left,
+    Right,
+    Top,
+    Bottom,
+}
+
+/// Chat surrounds the workspace; the explorer surrounds the document split tree.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", default, deny_unknown_fields)]
+pub struct PaneLayoutConfig {
+    pub opencode_position: PanePosition,
+    /// Percentage of the entire editor area, along the selected edge's axis.
+    #[serde(deserialize_with = "deserialize_pane_percentage")]
+    pub opencode_size: u8,
+    pub file_explorer_position: PanePosition,
+    /// Percentage of the workspace remaining after chat is allocated.
+    #[serde(deserialize_with = "deserialize_pane_percentage")]
+    pub file_explorer_size: u8,
+}
+
+impl Default for PaneLayoutConfig {
+    fn default() -> Self {
+        Self {
+            opencode_position: PanePosition::Left,
+            opencode_size: 40,
+            file_explorer_position: PanePosition::Left,
+            file_explorer_size: 25,
+        }
+    }
+}
+
+fn deserialize_pane_percentage<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u8, D::Error> {
+    let value = u8::deserialize(deserializer)?;
+    if (1..=99).contains(&value) {
+        Ok(value)
+    } else {
+        Err(serde::de::Error::custom(
+            "pane size must be a percentage from 1 to 99",
+        ))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case", default, deny_unknown_fields)]
 pub struct Config {
@@ -367,6 +413,7 @@ pub struct Config {
     pub auto_info: bool,
     pub file_picker: FilePickerConfig,
     pub file_explorer: FileExplorerConfig,
+    pub panes: PaneLayoutConfig,
     /// Configuration of the statusline elements
     pub statusline: StatusLineConfig,
     /// Shape for cursor in each mode
@@ -1179,6 +1226,7 @@ impl Default for Config {
             auto_info: true,
             file_picker: FilePickerConfig::default(),
             file_explorer: FileExplorerConfig::default(),
+            panes: PaneLayoutConfig::default(),
             statusline: StatusLineConfig::default(),
             cursor_shape: CursorShapeConfig::default(),
             true_color: false,
@@ -2077,6 +2125,27 @@ impl Editor {
     }
 
     // ??? possible use for integration tests
+    /// Compare a document with the version control default (`HEAD`) again,
+    /// discarding a branch or turn comparison.
+    pub fn reset_diff_base(&mut self, id: DocumentId) {
+        let Some(doc) = self.documents.get_mut(&id) else {
+            return;
+        };
+        doc.clear_diff_source();
+        let Some(path) = doc.path().map(Path::to_path_buf) else {
+            doc.remove_diff_handle();
+            return;
+        };
+        let trust_full = self
+            .workspace_trust
+            .query(doc.workspace_root(), TrustQuery::Git)
+            .is_trusted();
+        match self.diff_providers.get_diff_base(&path, trust_full) {
+            Some(diff_base) => doc.set_diff_base(diff_base),
+            None => doc.remove_diff_handle(),
+        }
+    }
+
     pub fn open(&mut self, path: &Path, action: Action) -> Result<DocumentId, DocumentOpenError> {
         let path = helix_stdx::path::canonicalize(path);
         let id = self.document_id_by_path(&path);

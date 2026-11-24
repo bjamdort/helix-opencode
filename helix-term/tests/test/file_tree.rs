@@ -13,6 +13,66 @@ fn fixture() -> anyhow::Result<(tempfile::TempDir, helix_term::application::Appl
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn backslash_opens_below_and_shift_backslash_opens_right_without_replacing_existing_views(
+) -> anyhow::Result<()> {
+    for (keys, horizontal) in [(" .j\\", true), (" .j|", false)] {
+        let (root, mut app) = fixture()?;
+        let original = std::cell::Cell::new(None);
+        test_key_sequences(
+            &mut app,
+            vec![
+                (
+                    Some("A!<esc>:vsplit<ret>"),
+                    Some(&|app| {
+                        original.set(Some(app.editor.tree.focus));
+                        assert_eq!(app.editor.tree.views().count(), 2);
+                    }),
+                ),
+                (
+                    Some(keys),
+                    Some(&|app| {
+                        assert!(app.editor.focused_pane.is_none());
+                        assert_eq!(app.editor.tree.views().count(), 3);
+                        assert_eq!(doc!(app.editor).path().unwrap(), &root.path().join("b.txt"));
+                        let old_view = app
+                            .editor
+                            .tree
+                            .views()
+                            .find(|(view, _)| Some(view.id) == original.get())
+                            .unwrap()
+                            .0;
+                        let new_view = current_ref!(app.editor).0;
+                        assert_ne!(new_view.id, old_view.id);
+                        let old_doc = app.editor.document(old_view.doc).unwrap();
+                        assert_eq!(old_doc.text().to_string(), "a.txt!\n");
+                        assert!(old_doc.is_modified());
+                        if horizontal {
+                            assert_eq!(new_view.area.x, old_view.area.x);
+                            assert!(new_view.area.y >= old_view.area.bottom());
+                        } else {
+                            assert_eq!(new_view.area.y, old_view.area.y);
+                            assert!(new_view.area.x >= old_view.area.right());
+                        }
+                    }),
+                ),
+                (
+                    Some(" ."),
+                    Some(&|app| assert!(app.editor.focused_pane.is_some())),
+                ),
+                (Some(":qa!<ret>"), None),
+            ],
+            true,
+        )
+        .await?;
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("a.txt"))?,
+            "a.txt\n"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn global_prompt_and_quit_all_work_with_pane_focus() -> anyhow::Result<()> {
     let (_root, mut app) = fixture()?;
     test_key_sequences(

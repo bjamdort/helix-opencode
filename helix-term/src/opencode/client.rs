@@ -190,6 +190,28 @@ impl Api {
             .data)
     }
 
+    pub async fn sessions_page(
+        &self,
+        cursor: Option<&str>,
+    ) -> Result<super::sessions::SessionPage> {
+        let mut url = Url::parse("http://localhost/api/session")?;
+        url.query_pairs_mut().append_pair("limit", "100");
+        if let Some(cursor) = cursor {
+            url.query_pairs_mut().append_pair("cursor", cursor);
+        } else {
+            url.query_pairs_mut()
+                .append_pair("order", "desc")
+                .append_pair("parentID", "null")
+                .append_pair("archived", "false");
+        }
+        self.json(
+            Method::GET,
+            &format!("api/session?{}", url.query().unwrap()),
+            None,
+        )
+        .await
+    }
+
     pub async fn create(&self, id: &str, directory: &std::path::Path) -> Result<Session> {
         Ok(self
             .json::<Data<Session>>(
@@ -341,10 +363,34 @@ impl Api {
     }
 
     pub async fn changes(&self, session: &str) -> Result<Vec<FileChange>> {
+        self.turn_changes(session, None, Some(3)).await
+    }
+
+    /// Per-file turn patches. Without `context`, patches contain whole files,
+    /// so the file before the turn can be read from them.
+    pub async fn turn_changes(
+        &self,
+        session: &str,
+        from: Option<&str>,
+        context: Option<u32>,
+    ) -> Result<Vec<FileChange>> {
+        let mut query = Url::parse("http://localhost/")?;
+        if let Some(context) = context {
+            query
+                .query_pairs_mut()
+                .append_pair("context", &context.to_string());
+        }
+        if let Some(from) = from {
+            anyhow::ensure!(super::valid_id(from, "msg"), "Invalid user message ID");
+            query.query_pairs_mut().append_pair("from", from);
+        }
         Ok(self
             .json::<Data<Vec<FileChange>>>(
                 Method::GET,
-                &format!("api/session/{session}/diff?context=3"),
+                &format!(
+                    "api/session/{session}/diff?{}",
+                    query.query().unwrap_or_default()
+                ),
                 None,
             )
             .await?

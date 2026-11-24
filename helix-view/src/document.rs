@@ -207,6 +207,12 @@ pub struct Document {
     pub(crate) language_servers: HashMap<LanguageServerName, Arc<Client>>,
 
     diff_handle: Option<DiffHandle>,
+    /// What the diff base was set from, when it is not the version control
+    /// provider's default (`HEAD`), such as a branch point or an agent turn.
+    diff_source: Option<String>,
+    /// Show changes against the diff base inside the text: changed lines are
+    /// shaded and removed lines are drawn as virtual lines.
+    pub inline_diff: bool,
     version_control_head: Option<Arc<ArcSwap<Box<str>>>>,
 
     // when document was used for most-recent-used buffer picker
@@ -760,6 +766,8 @@ impl Document {
             modified_since_accessed: false,
             language_servers: HashMap::new(),
             diff_handle: None,
+            diff_source: None,
+            inline_diff: false,
             config,
             version_control_head: None,
             focused_at: std::time::Instant::now(),
@@ -1339,9 +1347,12 @@ impl Document {
         self.pickup_last_saved_time();
         self.detect_indent_and_line_ending();
 
-        match provider_registry.get_diff_base(&path, trust_full) {
-            Some(diff_base) => self.set_diff_base(diff_base),
-            None => self.diff_handle = None,
+        // A chosen comparison does not depend on the file on disk, so keep it.
+        if self.diff_source.is_none() {
+            match provider_registry.get_diff_base(&path, trust_full) {
+                Some(diff_base) => self.set_diff_base(diff_base),
+                None => self.diff_handle = None,
+            }
         }
 
         self.version_control_head = provider_registry.get_current_head_name(&path, trust_full);
@@ -2046,6 +2057,27 @@ impl Document {
         } else {
             self.diff_handle = None;
         }
+    }
+
+    /// Compare with `diff_base` instead of the version control default until
+    /// [`Editor::reset_diff_base`](crate::Editor::reset_diff_base). `label`
+    /// names the comparison, for example a branch or an agent turn.
+    pub fn set_custom_diff_base(&mut self, diff_base: Vec<u8>, label: String) {
+        self.set_diff_base(diff_base);
+        self.diff_source = self.diff_handle.is_some().then_some(label);
+    }
+
+    /// The label of a custom diff base, or `None` for the version control default.
+    pub fn diff_source(&self) -> Option<&str> {
+        self.diff_source.as_deref()
+    }
+
+    pub(crate) fn clear_diff_source(&mut self) {
+        self.diff_source = None;
+    }
+
+    pub(crate) fn remove_diff_handle(&mut self) {
+        self.diff_handle = None;
     }
 
     pub fn version_control_head(&self) -> Option<Arc<Box<str>>> {
